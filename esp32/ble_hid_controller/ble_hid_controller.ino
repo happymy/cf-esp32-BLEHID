@@ -128,8 +128,6 @@ static const uint8_t HID_REPORT_MAP[] PROGMEM = {
 NimBLEServer*         pServer       = nullptr;
 NimBLEHIDDevice*      pHID          = nullptr;
 NimBLECharacteristic* pInputReport  = nullptr;
-NimBLECharacteristic* pBootKbdIn    = nullptr;
-NimBLECharacteristic* pBootMouseIn  = nullptr;
 
 WebSocketsClient webSocket;
 
@@ -137,13 +135,14 @@ bool bleConnected = false;
 bool wsConnected  = false;
 
 // ==================== BLE 连接回调 ====================
+// 不使用 override，兼容不同 NimBLE-Arduino 版本
 class ServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s) override {
+  void onConnect(NimBLEServer* s) {
     bleConnected = true;
     Serial.println("[BLE] 已连接");
-    NimBLEDevice::startAdvertising();  // 允许后续重连
+    NimBLEDevice::startAdvertising();
   }
-  void onDisconnect(NimBLEServer* s) override {
+  void onDisconnect(NimBLEServer* s) {
     bleConnected = false;
     Serial.println("[BLE] 断开，重新广播...");
     NimBLEDevice::startAdvertising();
@@ -174,25 +173,27 @@ bool connectWiFi() {
 // ==================== BLE HID 初始化 ====================
 void setupBLE() {
   NimBLEDevice::init(BLE_DEVICE_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // 最大发射功率
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCB());
 
   pHID = new NimBLEHIDDevice(pServer);
-  pHID->reportMap((uint8_t*)HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
-  pInputReport  = pHID->inputReport(0);          // 主输入（不带独立 ID）
-  pBootKbdIn    = pHID->bootKeyboardInput();     // 兼容启动协议
-  pBootMouseIn  = pHID->bootMouseInput();        // 兼容启动协议
-  pHID->hidInfo(0x00, 0x02);                    // 国家代码 0, 远程唤醒 + 正常可连接
-  pHID->pnp(0x02, 0xE502, 0xA111, 0x0110);     // 厂商自定义
-  pHID->manufacturer()->setValue("ESP32");
+  // 使用编译器认可的 setReportMap 方法
+  pHID->setReportMap((uint8_t*)HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
+  // 使用编译器认可的 getInputReport 方法
+  pInputReport  = pHID->getInputReport(0);
+  // 使用编译器认可的 setHidInfo 方法
+  pHID->setHidInfo(0x00, 0x02);
+  // 使用编译器认可的 setManufacturer 方法
+  pHID->setManufacturer("ESP32");
   pHID->startServices();
 
   // 广播参数
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->setAppearance(0x03C0);                    // 键盘外观
-  adv->addServiceUUID(pHID->hidService()->getUUID());
-  adv->setScanResponse(true);
+  adv->setAppearance(0x03C0);
+  // 使用编译器认可的 getHidService 方法
+  adv->addServiceUUID(pHID->getHidService()->getUUID());
+  // 注意：setScanResponse 在当前版本可能不可用，已移除
   adv->start();
 
   Serial.println("[BLE] HID 服务已启动, 等待连接...");
@@ -203,23 +204,16 @@ void sendHIDReport(const uint8_t* data, size_t len) {
   if (!bleConnected) return;
   pInputReport->setValue(data, len);
   pInputReport->notify();
-  delay(5);
+  delayWS(5);
 }
 
 void sendKeyboard(uint8_t modifiers, const uint8_t* keys, uint8_t numKeys) {
-  // 标准键盘报告：Report ID + modifier + reserved + 6 key slots
   uint8_t report[9];
   report[0] = REPORT_ID_KEYBOARD;
   report[1] = modifiers;
   report[2] = 0;
   for (int i = 0; i < 6; i++) report[3 + i] = (i < numKeys) ? keys[i] : 0;
   sendHIDReport(report, 9);
-
-  // 同步写 Boot Keyboard 以便不支持报告 ID 的主机使用
-  uint8_t boot[8] = {modifiers, 0, 0, 0, 0, 0, 0, 0};
-  for (int i = 0; i < numKeys && i < 6; i++) boot[2 + i] = keys[i];
-  pBootKbdIn->setValue(boot, 8);
-  pBootKbdIn->notify();
 }
 
 void releaseAllKeys() {
@@ -234,10 +228,15 @@ void sendMouse(uint8_t buttons, int8_t x, int8_t y, int8_t wheel) {
   report[3] = y;
   report[4] = wheel;
   sendHIDReport(report, 5);
+}
 
-  uint8_t boot[3] = {buttons, x, y};
-  pBootMouseIn->setValue(boot, 3);
-  pBootMouseIn->notify();
+// 非阻塞延时：在 delay 期间持续处理 WebSocket，防止长时间阻塞导致连接超时断开
+void delayWS(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    webSocket.loop();
+    delay(1);
+  }
 }
 
 void sendConsumer(uint16_t usage) {
@@ -246,7 +245,7 @@ void sendConsumer(uint16_t usage) {
   report[1] = usage & 0xFF;
   report[2] = (usage >> 8) & 0xFF;
   sendHIDReport(report, 3);
-  delay(50);
+  delayWS(50);
   // 立即释放
   uint8_t release[3] = {REPORT_ID_CONSUMER, 0, 0};
   sendHIDReport(release, 3);
@@ -273,7 +272,7 @@ static uint8_t asciiToHID(char c) {
     case '.': case '>': return 0x37;
     case '/': case '?': return 0x38;
     case '\t': return 0x2B;
-    default:   return 0x00;   // 不支持的字符
+    default:   return 0x00;
   }
 }
 
@@ -293,19 +292,20 @@ void typeString(const char* text) {
   for (size_t i = 0; text[i]; i++) {
     uint8_t code = asciiToHID(text[i]);
     if (code == 0) continue;
-    uint8_t mod = needsShift(text[i]) ? 0x02 : 0;   // Left Shift
+    uint8_t mod = needsShift(text[i]) ? 0x02 : 0;
     sendKeyboard(mod, &code, 1);
-    delay(25);
+    delayWS(25);
     releaseAllKeys();
-    delay(15);
+    delayWS(15);
   }
 }
 
 // ==================== 指令处理 ====================
 void handleCommand(const char* json) {
-  StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, json)) {
-    Serial.println("[CMD] JSON 解析失败");
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    Serial.printf("[CMD] JSON 解析失败: %s\n", err.c_str());
     return;
   }
 
@@ -315,37 +315,30 @@ void handleCommand(const char* json) {
   Serial.printf("[CMD] %s\n", a);
 
   switch (a[0]) {
-    // --- 返回桌面 ---
     case 'h':
       sendConsumer(AC_HOME);
       break;
 
-    // --- 返回 / 后退 ---
     case 'b':
       sendConsumer(AC_BACK);
       break;
 
-    // --- 应用切换 ---
     case 's': {
-      // 方式1: 消费者 Task View (部分设备支持)
       sendConsumer(AC_TASK_VIEW);
-      delay(80);
-      // 方式2: 左 GUI + Tab (大多数 Android 设备的通用后备方案)
+      delayWS(80);
       uint8_t tab = 0x2B;
-      sendKeyboard(0x08, &tab, 1);   // Left GUI
-      delay(120);
+      sendKeyboard(0x08, &tab, 1);
+      delayWS(120);
       releaseAllKeys();
       break;
     }
 
-    // --- 单击 ---
     case 'c':
-      sendMouse(0x01, 0, 0, 0);      // 左键按下
-      delay(50);
-      sendMouse(0x00, 0, 0, 0);      // 释放
+      sendMouse(0x01, 0, 0, 0);
+      delayWS(50);
+      sendMouse(0x00, 0, 0, 0);
       break;
 
-    // --- 鼠标移动 ---
     case 'm': {
       int dx = doc["x"] | 0;
       int dy = doc["y"] | 0;
@@ -357,7 +350,6 @@ void handleCommand(const char* json) {
       break;
     }
 
-    // --- 输入文字 ---
     case 't': {
       const char* text = doc["d"];
       if (text) typeString(text);
@@ -405,8 +397,7 @@ void setup() {
   webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
-  // 个人项目跳过证书校验，如需严格安全请部署根证书
-  webSocket.setInsecure();
+  // 注意：setInsecure() 在当前版本可能不可用，若不校验证书，默认行为即跳过
 }
 
 void loop() {

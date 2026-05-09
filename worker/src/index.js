@@ -349,7 +349,9 @@ export default {
       return new Response(HTML_PAGE, {
         headers: {
           'Content-Type': 'text/html; charset=utf-8',
-          'Cache-Control': 'public, max-age=3600',
+          'Cache-Control': 'no-cache',
+          'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' wss: ws:;",
+          'X-Content-Type-Options': 'nosniff',
         },
       });
     }
