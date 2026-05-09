@@ -1,0 +1,8 @@
+node_modules/
+worker/dist/
+worker/.wrangler/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
