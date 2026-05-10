@@ -3,12 +3,13 @@ name = "cf-esp32-blehid"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 
-# 启用 WebSocket 支持
-[[durable_objects]]
-name = "WS_DO"
-class_name = "WebSocketDurableObject"
+# 启用 WebSocket 支持 (免费计划需启用 SQLite)
+[durable_objects]
+bindings = [
+  { name = "WS_DO", class_name = "WebSocketDurableObject", sqlite = true }
+]
 
 # 路由 - 所有请求由 Worker 处理
 [[migrations]]
-tag = "v1"
-new_classes = ["WebSocketDurableObject"]
+tag = "v2"
+new_sqlite_classes = ["WebSocketDurableObject"]

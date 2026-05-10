@@ -1,17 +1,11 @@
 /*
- * ESP32 BLE HID 遥控器 (接收端)
- * 
- * 功能:
- *  连接 Cloudflare Worker WebSocket，接收指令，
- *  通过 NimBLE 模拟蓝牙键盘/鼠标控制手机。
- * 
- * 依赖库 (Arduino IDE 库管理器安装):
- *  - NimBLE-Arduino      by h2zero
- *  - ArduinoJson         by Benoit Blanchon
- *  - arduinoWebSockets   by Markus Sattler (Links2004)
- * 
- * 配置:
- *  修改下方 WIFI_SSID / WIFI_PASS / WS_HOST 三个宏。
+ * ESP32 BLE HID 遥控器 - C3 v8 (回调绕过修复)
+ *
+ * v8 修复:
+ *   - 绕过不工作的 NimBLEServerCallbacks（当前 NimBLE 版本方法非 virtual）
+ *   - 在 loop() 中轮询 pServer->getConnectedCount() 检测 GATT 连接
+ *   - 安全配置保留在 init() 之前（bonding+Just Works+SC）
+ *   - 保留 v7b 所有改进（电池服务、调试日志、计数器）
  */
 
 #include <NimBLEDevice.h>
@@ -31,384 +25,380 @@ const int   WS_PORT  = 443;
 const char* WS_PATH  = "/ws";
 
 // ==================== BLE HID 常量 ====================
-#define BLE_DEVICE_NAME    "ESP32 BLE HID"
+#define BLE_DEVICE_NAME    "ESP32 BLE Remote"
 #define REPORT_ID_KEYBOARD 1
 #define REPORT_ID_MOUSE    2
 #define REPORT_ID_CONSUMER 3
 
-// 消费者控制码 (Usage Page 0x0C)
 #define AC_HOME      0x0223
 #define AC_BACK      0x0224
-#define AC_TASK_VIEW 0x0296   // 部分 Android 设备支持
+#define AC_TASK_VIEW 0x0296
 
-// HID 报告描述符 (键盘 + 鼠标 + 消费者控制)
+// 报告描述符（键盘 + 鼠标 + 消费者控制）
 static const uint8_t HID_REPORT_MAP[] PROGMEM = {
+  0x05,0x01,0x09,0x02,0xA1,0x01,0x85,0x02,0x09,0x01,
+  0xA1,0x00,0x05,0x09,0x19,0x01,0x29,0x03,0x15,0x00,
+  0x25,0x01,0x95,0x03,0x75,0x01,0x81,0x02,0x95,0x01,
+  0x75,0x05,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,
+  0x09,0x38,0x15,0x81,0x25,0x7F,0x75,0x08,0x95,0x03,
+  0x81,0x06,0xC0,0xC0,
 
-  // ---- 鼠标 (Report ID 2) ----
-  0x05, 0x01,        // Usage Page (Generic Desktop)
-  0x09, 0x02,        // Usage (Mouse)
-  0xA1, 0x01,        // Collection (Application)
-  0x85, 0x02,        //   Report ID (2)
-  0x09, 0x01,        //   Usage (Pointer)
-  0xA1, 0x00,        //   Collection (Physical)
-  0x05, 0x09,        //     Usage Page (Button)
-  0x19, 0x01,        //     Usage Minimum (1)
-  0x29, 0x03,        //     Usage Maximum (3)
-  0x15, 0x00,        //     Logical Minimum (0)
-  0x25, 0x01,        //     Logical Maximum (1)
-  0x95, 0x03,        //     Report Count (3)
-  0x75, 0x01,        //     Report Size (1)
-  0x81, 0x02,        //     Input (Data,Var,Abs)       - buttons
-  0x95, 0x01,        //     Report Count (1)
-  0x75, 0x05,        //     Report Size (5)
-  0x81, 0x01,        //     Input (Const)              - padding
-  0x05, 0x01,        //     Usage Page (Generic Desktop)
-  0x09, 0x30,        //     Usage (X)
-  0x09, 0x31,        //     Usage (Y)
-  0x09, 0x38,        //     Usage (Wheel)
-  0x15, 0x81,        //     Logical Minimum (-127)
-  0x25, 0x7F,        //     Logical Maximum (127)
-  0x75, 0x08,        //     Report Size (8)
-  0x95, 0x03,        //     Report Count (3)
-  0x81, 0x06,        //     Input (Data,Var,Rel)       - x, y, wheel
-  0xC0,              //   End Collection
-  0xC0,              // End Collection
+  0x05,0x01,0x09,0x06,0xA1,0x01,0x85,0x01,0x05,0x07,
+  0x19,0xE0,0x29,0xE7,0x15,0x00,0x25,0x01,0x75,0x01,
+  0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,0x81,0x01,
+  0x95,0x05,0x75,0x01,0x05,0x08,0x19,0x01,0x29,0x05,
+  0x91,0x02,0x95,0x01,0x75,0x03,0x91,0x01,0x95,0x06,
+  0x75,0x08,0x15,0x00,0x25,0x65,0x05,0x07,0x19,0x00,
+  0x29,0x65,0x81,0x00,0xC0,
 
-  // ---- 键盘 (Report ID 1) ----
-  0x05, 0x01,        // Usage Page (Generic Desktop)
-  0x09, 0x06,        // Usage (Keyboard)
-  0xA1, 0x01,        // Collection (Application)
-  0x85, 0x01,        //   Report ID (1)
-  0x05, 0x07,        //   Usage Page (Keyboard)
-  0x19, 0xE0,        //   Usage Minimum (224)          - Left Ctrl
-  0x29, 0xE7,        //   Usage Maximum (231)          - Right GUI
-  0x15, 0x00,        //   Logical Minimum (0)
-  0x25, 0x01,        //   Logical Maximum (1)
-  0x75, 0x01,        //   Report Size (1)
-  0x95, 0x08,        //   Report Count (8)
-  0x81, 0x02,        //   Input (Data,Var,Abs)         - modifier byte
-  0x95, 0x01,        //   Report Count (1)
-  0x75, 0x08,        //   Report Size (8)
-  0x81, 0x01,        //   Input (Const)                - reserved byte
-  0x95, 0x05,        //   Report Count (5)
-  0x75, 0x01,        //   Report Size (1)
-  0x05, 0x08,        //   Usage Page (LEDs)
-  0x19, 0x01,        //   Usage Minimum (1)
-  0x29, 0x05,        //   Usage Maximum (5)
-  0x91, 0x02,        //   Output (Data,Var,Abs)        - LED report
-  0x95, 0x01,        //   Report Count (1)
-  0x75, 0x03,        //   Report Size (3)
-  0x91, 0x01,        //   Output (Const)               - padding
-  0x95, 0x06,        //   Report Count (6)             - up to 6 keys
-  0x75, 0x08,        //   Report Size (8)
-  0x15, 0x00,        //   Logical Minimum (0)
-  0x25, 0x65,        //   Logical Maximum (101)
-  0x05, 0x07,        //   Usage Page (Keyboard)
-  0x19, 0x00,        //   Usage Minimum (0)
-  0x29, 0x65,        //   Usage Maximum (101)
-  0x81, 0x00,        //   Input (Data,Array)
-  0xC0,              // End Collection
-
-  // ---- 消费者控制 (Report ID 3) ----
-  0x05, 0x0C,        // Usage Page (Consumer Devices)
-  0x09, 0x01,        // Usage (Consumer Control)
-  0xA1, 0x01,        // Collection (Application)
-  0x85, 0x03,        //   Report ID (3)
-  0x15, 0x01,        //   Logical Minimum (1)
-  0x26, 0x9C, 0x02,  //   Logical Maximum (668)
-  0x19, 0x01,        //   Usage Minimum (1)
-  0x2A, 0x9C, 0x02,  //   Usage Maximum (668)
-  0x75, 0x10,        //   Report Size (16)
-  0x95, 0x01,        //   Report Count (1)
-  0x81, 0x00,        //   Input (Data,Array,Abs)
-  0xC0               // End Collection
+  0x05,0x0C,0x09,0x01,0xA1,0x01,0x85,0x03,0x15,0x01,
+  0x26,0x9C,0x02,0x19,0x01,0x2A,0x9C,0x02,0x75,0x10,
+  0x95,0x01,0x81,0x00,0xC0
 };
 
-// ==================== 全局对象 ====================
+// ==================== 动态分配对象 ====================
 NimBLEServer*         pServer       = nullptr;
 NimBLEHIDDevice*      pHID          = nullptr;
 NimBLECharacteristic* pInputReport  = nullptr;
+NimBLEAdvertising*    pAdvertising  = nullptr;
+WebSocketsClient*     webSocket     = nullptr;
 
-WebSocketsClient webSocket;
+bool bleConnected   = false;
+bool bleEncrypted   = false;
+bool hidReady       = false;
+bool wsConnected    = false;
 
-bool bleConnected = false;
-bool wsConnected  = false;
+uint32_t g_notifyCount    = 0;
+uint32_t g_notifyFail     = 0;
+uint32_t g_bleDisconnects = 0;
+uint32_t g_cmdCount       = 0;
+uint32_t g_cmdSkipped     = 0;
+uint32_t g_prevConnCount  = 0;       // v8: 上一次轮询的连接数
 
-// ==================== BLE 连接回调 ====================
-// 不使用 override，兼容不同 NimBLE-Arduino 版本
+// ==================== BLE 连接回调（保留以兼容未来库版本） ====================
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s) {
+    Serial.println("[BLE] [回调] onConnect 触发");
     bleConnected = true;
-    Serial.println("[BLE] 已连接");
     NimBLEDevice::startAdvertising();
   }
   void onDisconnect(NimBLEServer* s) {
+    Serial.println("[BLE] [回调] onDisconnect 触发");
+    g_bleDisconnects++;
     bleConnected = false;
-    Serial.println("[BLE] 断开，重新广播...");
+    bleEncrypted = false;
     NimBLEDevice::startAdvertising();
   }
 };
 
-// ==================== WiFi ====================
-bool connectWiFi() {
-  Serial.print("[WiFi] 连接中: ");
-  Serial.println(WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+// ==================== 内存保护 ====================
+void checkHeap() {
+  size_t free = esp_get_free_heap_size();
+  if (free < 30000) {
+    Serial.printf("[MEM] 堆内存过低 (%u)，重启...\n", free);
+    ESP.restart();
+  }
+}
 
+// ==================== WiFi 连接 ====================
+bool connectWiFi() {
+  Serial.println("[WiFi] 开始连接...");
+  Serial.flush();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   int retry = 0;
   while (WiFi.status() != WL_CONNECTED && retry < 40) {
     delay(500);
     Serial.print(".");
     retry++;
   }
-  bool ok = (WiFi.status() == WL_CONNECTED);
-  if (ok) {
-    Serial.println("\n[WiFi] 已连接, IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\n[WiFi] 连接失败!");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WiFi] 已连接, IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
   }
-  return ok;
+  Serial.println("\n[WiFi] 连接失败!");
+  return false;
 }
 
-// ==================== BLE HID 初始化 ====================
+// ==================== BLE 初始化 ====================
 void setupBLE() {
+  Serial.println("[BLE] 初始化...");
+  Serial.flush();
+
+  // ========== 安全配置 — 必须在 init() 之前！ ==========
+  NimBLEDevice::setSecurityAuth(true, false, true);  // bonding=ON, MITM=OFF, SC=ON
+  NimBLEDevice::setSecurityIOCap(3);                  // NoInputNoOutput
+  Serial.println("[BLE] 安全: bonding=ON, MITM=OFF, SC=ON, IO=NoInputNoOutput");
+  Serial.flush();
+
   NimBLEDevice::init(BLE_DEVICE_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  Serial.printf("[BLE] MAC: %s\n", NimBLEDevice::getAddress().toString().c_str());
+  Serial.flush();
+
   pServer = NimBLEDevice::createServer();
+  if (!pServer) { Serial.println("[BLE] ✗ 创建 Server 失败"); return; }
   pServer->setCallbacks(new ServerCB());
+  Serial.println("[BLE] Server 已创建，回调已注册");
 
   pHID = new NimBLEHIDDevice(pServer);
-  // 使用编译器认可的 setReportMap 方法
+  if (!pHID) { Serial.println("[BLE] ✗ 创建 HID 失败"); return; }
+
   pHID->setReportMap((uint8_t*)HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
-  // 使用编译器认可的 getInputReport 方法
-  pInputReport  = pHID->getInputReport(0);
-  // 使用编译器认可的 setHidInfo 方法
-  pHID->setHidInfo(0x00, 0x02);
-  // 使用编译器认可的 setManufacturer 方法
+  pHID->setHidInfo(0x0111, 0x00);
   pHID->setManufacturer("ESP32");
+  pHID->setBatteryLevel(100);
+  Serial.println("[BLE] HID 设备配置完成 (含电池服务)");
+
   pHID->startServices();
 
-  // 广播参数
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->setAppearance(0x03C0);
-  // 使用编译器认可的 getHidService 方法
-  adv->addServiceUUID(pHID->getHidService()->getUUID());
-  // 注意：setScanResponse 在当前版本可能不可用，已移除
-  adv->start();
+  pInputReport = pHID->getInputReport(0);
+  if (pInputReport) {
+    hidReady = true;
+    Serial.println("[BLE] 输入报告就绪");
+  } else {
+    Serial.println("[BLE] ✗ 错误：无法获取输入报告！");
+  }
 
-  Serial.println("[BLE] HID 服务已启动, 等待连接...");
+  // 广播配置
+  pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->setName(BLE_DEVICE_NAME);
+  pAdvertising->setAppearance(0x03C0);
+  pAdvertising->setMinInterval(32);
+  pAdvertising->setMaxInterval(48);
+  if (pHID->getHidService()) {
+    pAdvertising->addServiceUUID(pHID->getHidService()->getUUID());
+    Serial.println("[BLE] HID Service UUID 已加入广播数据");
+  } else {
+    Serial.println("[BLE] ✗ 警告: HID Service 不存在！");
+  }
+
+  if (pAdvertising->start()) {
+    Serial.println("[BLE] 广播已启动！设备可见");
+    Serial.printf("[BLE] 名称: %s\n", BLE_DEVICE_NAME);
+  } else {
+    Serial.println("[BLE] ✗ 广播启动失败！");
+  }
+  Serial.flush();
 }
 
-// ==================== 底层报告发送 ====================
-void sendHIDReport(const uint8_t* data, size_t len) {
-  if (!bleConnected) return;
-  pInputReport->setValue(data, len);
-  pInputReport->notify();
-  delayWS(5);
+// ==================== v8: 轮询检测 GATT 连接状态 ====================
+void pollBLEConnection() {
+  if (!pServer) return;
+  
+  int count = pServer->getConnectedCount();
+  
+  if (count > 0 && g_prevConnCount == 0) {
+    // 新连接建立
+    bleConnected = true;
+    Serial.printf("[BLE] ✓ GATT 已连接 (轮询, conn=%d)\n", count);
+  } else if (count == 0 && g_prevConnCount > 0) {
+    // 连接断开
+    bleConnected = false;
+    bleEncrypted = false;
+    Serial.println("[BLE] GATT 断开 (轮询)");
+  }
+  
+  g_prevConnCount = count;
 }
 
-void sendKeyboard(uint8_t modifiers, const uint8_t* keys, uint8_t numKeys) {
-  uint8_t report[9];
-  report[0] = REPORT_ID_KEYBOARD;
-  report[1] = modifiers;
-  report[2] = 0;
-  for (int i = 0; i < 6; i++) report[3 + i] = (i < numKeys) ? keys[i] : 0;
-  sendHIDReport(report, 9);
-}
-
-void releaseAllKeys() {
-  sendKeyboard(0, nullptr, 0);
-}
-
-void sendMouse(uint8_t buttons, int8_t x, int8_t y, int8_t wheel) {
-  uint8_t report[5];
-  report[0] = REPORT_ID_MOUSE;
-  report[1] = buttons;
-  report[2] = x;
-  report[3] = y;
-  report[4] = wheel;
-  sendHIDReport(report, 5);
-}
-
-// 非阻塞延时：在 delay 期间持续处理 WebSocket，防止长时间阻塞导致连接超时断开
+// ==================== 延时 ====================
 void delayWS(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) {
-    webSocket.loop();
+    if (webSocket) webSocket->loop();
     delay(1);
   }
 }
 
+// ==================== HID 报告发送 ====================
+void sendHIDReport(const uint8_t* data, size_t len) {
+  if (!bleConnected || !pInputReport || !hidReady) return;
+  pInputReport->setValue(data, len);
+  if (pInputReport->notify()) g_notifyCount++;
+  else g_notifyFail++;
+  delayWS(2);
+}
+
+void sendKeyboard(uint8_t mod, const uint8_t* keys, uint8_t count) {
+  uint8_t r[9] = {REPORT_ID_KEYBOARD, mod, 0};
+  for (int i=0;i<6;i++) r[3+i] = i<count ? keys[i] : 0;
+  sendHIDReport(r, 9);
+}
+
+void releaseKeys() {
+  uint8_t r[9] = {REPORT_ID_KEYBOARD,0,0,0,0,0,0,0,0};
+  sendHIDReport(r,9);
+}
+
+void sendMouse(uint8_t btn, int8_t x, int8_t y, int8_t w) {
+  uint8_t r[5] = {REPORT_ID_MOUSE, btn, (uint8_t)x, (uint8_t)y, (uint8_t)w};
+  sendHIDReport(r, 5);
+}
+
 void sendConsumer(uint16_t usage) {
-  uint8_t report[3];
-  report[0] = REPORT_ID_CONSUMER;
-  report[1] = usage & 0xFF;
-  report[2] = (usage >> 8) & 0xFF;
-  sendHIDReport(report, 3);
-  delayWS(50);
-  // 立即释放
-  uint8_t release[3] = {REPORT_ID_CONSUMER, 0, 0};
-  sendHIDReport(release, 3);
+  uint8_t r[3] = {REPORT_ID_CONSUMER, (uint8_t)(usage&0xFF), (uint8_t)(usage>>8)};
+  sendHIDReport(r, 3);
+  delayWS(40);
+  uint8_t z[3] = {REPORT_ID_CONSUMER,0,0};
+  sendHIDReport(z, 3);
 }
 
 // ==================== 文字输入 ====================
-static uint8_t asciiToHID(char c) {
-  if (c >= 'a' && c <= 'z') return c - 'a' + 0x04;
-  if (c >= 'A' && c <= 'Z') return c - 'A' + 0x04;
-  if (c >= '1' && c <= '9') return c - '1' + 0x1E;
-  if (c == '0') return 0x27;
-  switch (c) {
-    case ' ':  return 0x2C;
-    case '\n': case '\r': return 0x28;
-    case '-': case '_': return 0x2D;
-    case '=': case '+': return 0x2E;
-    case '[': case '{': return 0x2F;
-    case ']': case '}': return 0x30;
-    case '\\': case '|': return 0x31;
-    case ';': case ':': return 0x33;
-    case '\'': case '"': return 0x34;
-    case '`': case '~': return 0x35;
-    case ',': case '<': return 0x36;
-    case '.': case '>': return 0x37;
-    case '/': case '?': return 0x38;
-    case '\t': return 0x2B;
-    default:   return 0x00;
+uint8_t asciiToHID(char c) {
+  if (c>='a' && c<='z') return c-'a'+4;
+  if (c>='A' && c<='Z') return c-'A'+4;
+  if (c>='1' && c<='9') return c-'1'+30;
+  if (c=='0') return 39;
+  switch(c) {
+    case ' ':return 44; case '\n':case '\r':return 40;
+    case '-':case '_':return 45; case '=':case '+':return 46;
+    case '[':case '{':return 47; case ']':case '}':return 48;
+    case '\\':case '|':return 49; case ';':case ':':return 51;
+    case '\'':case '"':return 52; case '`':case '~':return 53;
+    case ',':case '<':return 54; case '.':case '>':return 55;
+    case '/':case '?':return 56; case '\t':return 43;
+    default:return 0;
   }
 }
-
-static bool needsShift(char c) {
-  if (c >= 'A' && c <= 'Z') return true;
-  switch (c) {
-    case '!': case '@': case '#': case '$': case '%':
-    case '^': case '&': case '*': case '(': case ')':
-    case '_': case '+': case '{': case '}': case '|':
-    case ':': case '"': case '~': case '<': case '>':
-    case '?': return true;
+bool needsShift(char c) {
+  if (c>='A' && c<='Z') return true;
+  switch(c) {
+    case '!':case '@':case '#':case '$':case '%':case '^':case '&':
+    case '*':case '(':case ')':case '_':case '+':case '{':case '}':
+    case '|':case ':':case '"':case '~':case '<':case '>':case '?':
+      return true;
   }
   return false;
 }
-
 void typeString(const char* text) {
-  for (size_t i = 0; text[i]; i++) {
+  for (int i=0; text[i]; i++) {
     uint8_t code = asciiToHID(text[i]);
-    if (code == 0) continue;
-    uint8_t mod = needsShift(text[i]) ? 0x02 : 0;
-    sendKeyboard(mod, &code, 1);
+    if (!code) continue;
+    sendKeyboard(needsShift(text[i]) ? 0x02 : 0, &code, 1);
     delayWS(25);
-    releaseAllKeys();
+    releaseKeys();
     delayWS(15);
   }
 }
 
 // ==================== 指令处理 ====================
 void handleCommand(const char* json) {
-  StaticJsonDocument<512> doc;
-  DeserializationError err = deserializeJson(doc, json);
-  if (err) {
-    Serial.printf("[CMD] JSON 解析失败: %s\n", err.c_str());
+  StaticJsonDocument<384> doc;
+  if (deserializeJson(doc, json)) return;
+  const char* a = doc["a"]; if (!a) return;
+
+  g_cmdCount++;
+  Serial.printf("[CMD] #%u: a=%s", g_cmdCount, a);
+  if (doc.containsKey("x")) Serial.printf(" x=%d", doc["x"].as<int>());
+  if (doc.containsKey("y")) Serial.printf(" y=%d", doc["y"].as<int>());
+  if (doc.containsKey("d")) Serial.printf(" d=\"%s\"", doc["d"].as<const char*>());
+  Serial.println();
+
+  if (!hidReady) {
+    g_cmdSkipped++;
+    Serial.println("[CMD] ✗ 跳过: hidReady=false");
+    return;
+  }
+  if (!bleConnected) {
+    g_cmdSkipped++;
+    Serial.println("[CMD] ✗ 跳过: BLE 未连接");
     return;
   }
 
-  const char* a = doc["a"];
-  if (!a) return;
-
-  Serial.printf("[CMD] %s\n", a);
-
-  switch (a[0]) {
-    case 'h':
-      sendConsumer(AC_HOME);
-      break;
-
-    case 'b':
-      sendConsumer(AC_BACK);
-      break;
-
-    case 's': {
-      sendConsumer(AC_TASK_VIEW);
-      delayWS(80);
-      uint8_t tab = 0x2B;
-      sendKeyboard(0x08, &tab, 1);
-      delayWS(120);
-      releaseAllKeys();
-      break;
-    }
-
-    case 'c':
-      sendMouse(0x01, 0, 0, 0);
-      delayWS(50);
-      sendMouse(0x00, 0, 0, 0);
-      break;
-
+  switch(a[0]) {
+    case 'h': sendConsumer(AC_HOME); break;
+    case 'b': sendConsumer(AC_BACK); break;
+    case 's': sendConsumer(AC_TASK_VIEW); delayWS(80);
+              { uint8_t t=0x2B; sendKeyboard(0x08, &t,1); delayWS(120); releaseKeys(); }
+              break;
+    case 'c': sendMouse(1,0,0,0); delayWS(50); sendMouse(0,0,0,0); break;
     case 'm': {
-      int dx = doc["x"] | 0;
-      int dy = doc["y"] | 0;
-      if (dx >  127) dx =  127;
-      if (dx < -127) dx = -127;
-      if (dy >  127) dy =  127;
-      if (dy < -127) dy = -127;
-      sendMouse(0x00, (int8_t)dx, (int8_t)dy, 0);
+      int dx = doc["x"]|0, dy = doc["y"]|0;
+      if (dx>127) dx=127; if (dx<-127) dx=-127;
+      if (dy>127) dy=127; if (dy<-127) dy=-127;
+      sendMouse(0,(int8_t)dx,(int8_t)dy,0);
       break;
     }
-
-    case 't': {
-      const char* text = doc["d"];
-      if (text) typeString(text);
-      break;
-    }
+    case 't': if (doc["d"]) typeString(doc["d"]); break;
   }
 }
 
 // ==================== WebSocket 事件 ====================
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      Serial.println("[WS] 断开");
-      wsConnected = false;
-      break;
-    case WStype_CONNECTED:
-      Serial.println("[WS] 已连接");
-      wsConnected = true;
-      break;
-    case WStype_TEXT:
-      handleCommand((char*)payload);
-      break;
-    case WStype_ERROR:
-      Serial.println("[WS] 错误");
-      wsConnected = false;
-      break;
-    default:
-      break;
+void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED: wsConnected=false; break;
+    case WStype_CONNECTED: wsConnected=true; break;
+    case WStype_TEXT: handleCommand((char*)payload); break;
+    case WStype_ERROR: wsConnected=false; break;
+    default: break;
   }
 }
 
-// ==================== 主程序 ====================
+// ==================== setup ====================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n=== ESP32 BLE HID 遥控器 ===");
+  delay(2000);
+  Serial.println("\n\nESP32 BLE HID v8 (polling fix)");
+  Serial.printf("Chip: %s, Flash: %dMB, Heap: %d\n",
+    ESP.getChipModel(), ESP.getFlashChipSize()/1048576, ESP.getFreeHeap());
+  Serial.flush();
 
+  // 1. BLE (+ 安全配置)
+  setupBLE();
+  checkHeap();
+
+  // 2. WiFi
   if (!connectWiFi()) {
+    Serial.println("WiFi 失败，重启");
     delay(3000);
     ESP.restart();
   }
+  checkHeap();
 
-  setupBLE();
+  // 3. WebSocket
+  webSocket = new WebSocketsClient();
+  if (webSocket) {
+    webSocket->beginSSL(WS_HOST, WS_PORT, WS_PATH);
+    webSocket->onEvent(onWsEvent);
+    webSocket->setReconnectInterval(3000);
+    Serial.println("[WS] 开始连接...");
+  } else {
+    Serial.println("[E] WebSocket 分配失败");
+  }
 
-  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-  // 注意：setInsecure() 在当前版本可能不可用，若不校验证书，默认行为即跳过
+  Serial.println("初始化完成\n");
+  Serial.flush();
 }
 
 void loop() {
-  webSocket.loop();
+  if (webSocket) webSocket->loop();
+  checkHeap();
 
-  // 定期检查 WiFi
+  // v8: 每 1 秒轮询一次 GATT 连接数（绕过不工作的回调）
+  static unsigned long lastPoll = 0;
+  if (millis() - lastPoll > 1000) {
+    lastPoll = millis();
+    pollBLEConnection();
+  }
+
+  // 每 15 秒输出状态
+  static unsigned long lastStatus = 0;
+  if (millis() - lastStatus > 15000) {
+    lastStatus = millis();
+    Serial.printf("[STAT] BLE=%d CONN=%d WS=%d CMD=%u 跳过=%u OK:%u FAIL:%u 断=%u 堆=%d\n",
+      bleConnected,
+      pServer ? pServer->getConnectedCount() : -1,
+      wsConnected,
+      g_cmdCount, g_cmdSkipped,
+      g_notifyCount, g_notifyFail, g_bleDisconnects,
+      ESP.getFreeHeap());
+  }
+
+  // WiFi 重连检查
   static unsigned long lastCheck = 0;
-  if (millis() - lastCheck > 15000) {
+  if (millis() - lastCheck > 30000) {
     lastCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] 连接丢失，重连...");
+      Serial.println("[WiFi] 断开，重连...");
       WiFi.reconnect();
     }
   }
