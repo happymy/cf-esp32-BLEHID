@@ -1,11 +1,10 @@
 /*
- * ESP32 BLE HID 遥控器 - C3 v8 (回调绕过修复)
+ * ESP32 BLE HID 遥控器 - C3 v9 (拖拽支持)
  *
- * v8 修复:
- *   - 绕过不工作的 NimBLEServerCallbacks（当前 NimBLE 版本方法非 virtual）
- *   - 在 loop() 中轮询 pServer->getConnectedCount() 检测 GATT 连接
- *   - 安全配置保留在 init() 之前（bonding+Just Works+SC）
- *   - 保留 v7b 所有改进（电池服务、调试日志、计数器）
+ * v9 修复:
+ *   - 鼠标移动指令支持按钮状态字段 b (0=抬起, 1=左键按下)
+ *   - 配合 Web 前端锁定按钮实现拖拽功能
+ *   - 保留 v8 所有修复（轮询 BLE 连接、安全配置、电池服务等）
  */
 
 #include <NimBLEDevice.h>
@@ -73,7 +72,7 @@ uint32_t g_notifyFail     = 0;
 uint32_t g_bleDisconnects = 0;
 uint32_t g_cmdCount       = 0;
 uint32_t g_cmdSkipped     = 0;
-uint32_t g_prevConnCount  = 0;       // v8: 上一次轮询的连接数
+uint32_t g_prevConnCount  = 0;
 
 // ==================== BLE 连接回调（保留以兼容未来库版本） ====================
 class ServerCB : public NimBLEServerCallbacks {
@@ -180,18 +179,16 @@ void setupBLE() {
   Serial.flush();
 }
 
-// ==================== v8: 轮询检测 GATT 连接状态 ====================
+// ==================== 轮询检测 GATT 连接状态 ====================
 void pollBLEConnection() {
   if (!pServer) return;
   
   int count = pServer->getConnectedCount();
   
   if (count > 0 && g_prevConnCount == 0) {
-    // 新连接建立
     bleConnected = true;
     Serial.printf("[BLE] ✓ GATT 已连接 (轮询, conn=%d)\n", count);
   } else if (count == 0 && g_prevConnCount > 0) {
-    // 连接断开
     bleConnected = false;
     bleEncrypted = false;
     Serial.println("[BLE] GATT 断开 (轮询)");
@@ -290,6 +287,7 @@ void handleCommand(const char* json) {
   Serial.printf("[CMD] #%u: a=%s", g_cmdCount, a);
   if (doc.containsKey("x")) Serial.printf(" x=%d", doc["x"].as<int>());
   if (doc.containsKey("y")) Serial.printf(" y=%d", doc["y"].as<int>());
+  if (doc.containsKey("b")) Serial.printf(" btn=%d", doc["b"].as<int>());
   if (doc.containsKey("d")) Serial.printf(" d=\"%s\"", doc["d"].as<const char*>());
   Serial.println();
 
@@ -313,9 +311,11 @@ void handleCommand(const char* json) {
     case 'c': sendMouse(1,0,0,0); delayWS(50); sendMouse(0,0,0,0); break;
     case 'm': {
       int dx = doc["x"]|0, dy = doc["y"]|0;
+      // v9: 支持按钮状态字段 b（锁定拖拽）
+      uint8_t btn = doc["b"] | 0;
       if (dx>127) dx=127; if (dx<-127) dx=-127;
       if (dy>127) dy=127; if (dy<-127) dy=-127;
-      sendMouse(0,(int8_t)dx,(int8_t)dy,0);
+      sendMouse(btn, (int8_t)dx, (int8_t)dy, 0);
       break;
     }
     case 't': if (doc["d"]) typeString(doc["d"]); break;
@@ -337,7 +337,7 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("\n\nESP32 BLE HID v8 (polling fix)");
+  Serial.println("\n\nESP32 BLE HID v9 (drag support)");
   Serial.printf("Chip: %s, Flash: %dMB, Heap: %d\n",
     ESP.getChipModel(), ESP.getFlashChipSize()/1048576, ESP.getFreeHeap());
   Serial.flush();
@@ -373,7 +373,7 @@ void loop() {
   if (webSocket) webSocket->loop();
   checkHeap();
 
-  // v8: 每 1 秒轮询一次 GATT 连接数（绕过不工作的回调）
+  // 每 1 秒轮询 GATT 连接数
   static unsigned long lastPoll = 0;
   if (millis() - lastPoll > 1000) {
     lastPoll = millis();

@@ -5,6 +5,10 @@
  *   - 提供嵌入式 Web 控制页面 (响应式, 跨设备)
  *   - 通过 Durable Object + WebSocket 在浏览器与 ESP32 之间实时转发指令
  *   - 单个房间设计 (单ESP32, 简单可靠)
+ * 
+ * v2 新增:
+ *   - 鼠标锁定按钮 (拖拽支持)
+ *   - 鼠标速度滑块
  */
 
 // ==================== 嵌入式 Web 控制页面 ====================
@@ -58,6 +62,7 @@ body{
   display:flex;align-items:center;justify-content:center;
 }
 .touchpad-wrap.active{border-color:rgba(0,212,255,0.6);background:rgba(0,212,255,0.05)}
+.touchpad-wrap.locked{border-color:rgba(255,107,107,0.8);background:rgba(255,107,107,0.08)}
 .touchpad-hint{
   color:rgba(255,255,255,0.3);font-size:0.9rem;
   pointer-events:none;text-align:center;line-height:1.6;
@@ -85,6 +90,8 @@ body{
 .btn.danger{background:linear-gradient(135deg,#ff6b6b,#e94560)}
 .btn.warn{background:linear-gradient(135deg,#ffaa00,#ff8800);color:#000}
 .btn.success{background:linear-gradient(135deg,#00e676,#00b248);color:#000}
+.btn.locked{background:linear-gradient(135deg,#ff6b6b,#c0392b);animation:pulse-lock 0.8s infinite}
+@keyframes pulse-lock{0%,100%{box-shadow:0 0 0 0 rgba(255,107,107,0.6)}50%{box-shadow:0 0 0 8px rgba(255,107,107,0)}}
 .btn-icon{font-size:1.4rem}
 .input-row{display:flex;gap:10px;align-items:center}
 .input-row input{
@@ -97,6 +104,33 @@ body{
   transition:border-color 0.2s;
 }
 .input-row input:focus{border-color:#00d4ff}
+.speed-row{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 12px;
+  background:rgba(255,255,255,0.04);
+  border-radius:12px;
+}
+.speed-label{font-size:1.2rem;flex:0 0 auto}
+.speed-slider{
+  flex:1;-webkit-appearance:none;appearance:none;
+  height:6px;border-radius:3px;
+  background:rgba(255,255,255,0.15);
+  outline:none;
+}
+.speed-slider::-webkit-slider-thumb{
+  -webkit-appearance:none;appearance:none;
+  width:24px;height:24px;border-radius:50%;
+  background:#00d4ff;cursor:pointer;
+  box-shadow:0 0 6px rgba(0,212,255,0.4);
+}
+.speed-slider::-moz-range-thumb{
+  width:24px;height:24px;border-radius:50%;
+  background:#00d4ff;cursor:pointer;border:none;
+}
+.speed-value{
+  flex:0 0 36px;text-align:center;
+  font-size:0.85rem;font-weight:600;color:#00d4ff;
+}
 .footer{
   width:100%;max-width:480px;
   padding:6px 16px 12px;
@@ -120,17 +154,25 @@ body{
 <div class="container">
   <!-- 触摸板 -->
   <div class="touchpad-wrap" id="touchpad">
-    <div class="touchpad-hint">👆 滑动移动鼠标<br>轻点 = 单击</div>
+    <div class="touchpad-hint" id="touchHint">👆 滑动移动鼠标<br>轻点 = 单击</div>
     <div class="touchpad-dot" id="touchDot"></div>
   </div>
   <!-- 核心操作 -->
   <div class="row">
+    <button class="btn" id="lockBtn" onclick="toggleLock()">🔓 拖拽</button>
     <button class="btn accent" onclick="send('c')">👆 单击</button>
     <button class="btn" onclick="send('h')">🏠 桌面</button>
   </div>
   <div class="row">
     <button class="btn warn" onclick="send('s')">🔄 应用切换</button>
     <button class="btn danger" onclick="send('b')">⬅ 返回</button>
+  </div>
+  <!-- 鼠标速度 -->
+  <div class="speed-row">
+    <span class="speed-label">🐢</span>
+    <input type="range" id="speedSlider" min="0.25" max="3" step="0.25" value="1">
+    <span class="speed-label">🐇</span>
+    <span class="speed-value" id="speedValue">1×</span>
   </div>
   <!-- 文本输入 -->
   <div class="input-row">
@@ -143,10 +185,13 @@ body{
 <script>
 const TOUCHPAD = document.getElementById('touchpad');
 const DOT = document.getElementById('touchDot');
-const HINT = TOUCHPAD.querySelector('.touchpad-hint');
+const HINT = document.getElementById('touchHint');
 const STATUS_DOT = document.getElementById('statusDot');
 const STATUS_TEXT = document.getElementById('statusText');
 const TEXT_INPUT = document.getElementById('textInput');
+const LOCK_BTN = document.getElementById('lockBtn');
+const SPEED_SLIDER = document.getElementById('speedSlider');
+const SPEED_VALUE = document.getElementById('speedValue');
 
 let ws = null;
 let reconnectTimer = null;
@@ -154,9 +199,11 @@ let touchActive = false;
 let lastX = 0, lastY = 0;
 let touchStartTime = 0;
 let touchMoved = false;
-const TAP_THRESHOLD = 8;    // pixels: max movement for tap
-const TAP_TIME = 300;       // ms: max duration for tap
-const SEND_INTERVAL = 40;   // ms: throttle mouse move sends
+let mouseLocked = false;
+let mouseSpeed = 1.0;
+const TAP_THRESHOLD = 8;
+const TAP_TIME = 300;
+const SEND_INTERVAL = 40;
 
 // ---------- WebSocket ----------
 function connect(){
@@ -218,6 +265,28 @@ function sendText(){
   TEXT_INPUT.value = '';
 }
 
+// ---------- 鼠标锁定 (拖拽) ----------
+function toggleLock(){
+  mouseLocked = !mouseLocked;
+  if(mouseLocked){
+    LOCK_BTN.textContent = '🔒 拖拽中';
+    LOCK_BTN.classList.add('locked');
+    TOUCHPAD.classList.add('locked');
+    HINT.innerHTML = '🔒 拖拽模式<br>滑动 = 拖拽 | 点🔒 = 释放';
+  } else {
+    LOCK_BTN.textContent = '🔓 拖拽';
+    LOCK_BTN.classList.remove('locked');
+    TOUCHPAD.classList.remove('locked');
+    HINT.innerHTML = '👆 滑动移动鼠标<br>轻点 = 单击';
+  }
+}
+
+// ---------- 鼠标速度 ----------
+SPEED_SLIDER.addEventListener('input', () => {
+  mouseSpeed = parseFloat(SPEED_SLIDER.value);
+  SPEED_VALUE.textContent = mouseSpeed.toFixed(2) + '×';
+});
+
 // ---------- 触摸板 ----------
 function getPos(e){
   if(e.touches) return {x:e.touches[0].clientX, y:e.touches[0].clientY};
@@ -270,9 +339,15 @@ function throttledMouseMove(dx, dy){
   const now = Date.now();
   if(now - lastSendTime < SEND_INTERVAL) return;
   lastSendTime = now;
-  // Skip tiny movements to reduce noise
-  if(Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
-  send('m', {x:dx, y:dy});
+  // 应用速度缩放
+  const sx = Math.round(dx * mouseSpeed);
+  const sy = Math.round(dy * mouseSpeed);
+  // 跳过极小位移
+  if(Math.abs(sx) < 2 && Math.abs(sy) < 2) return;
+  // 锁定模式下附带鼠标左键按下
+  const msg = {a:'m', x:sx, y:sy};
+  if(mouseLocked) msg.b = 1;
+  send('m', msg);
 }
 
 // Touch events
