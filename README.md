@@ -5,16 +5,16 @@
 ## 架构
 
 ```
-浏览器 (登录 → Web 控制页面)
+浏览器 (登录 → Web 控制页面 · 移动端优先 Dark UI)
     ↕ WebSocket (Cookie 认证)
 Cloudflare Worker (Durable Object 中继)
     ↕ WebSocket (设备令牌认证 ?token=xxx)
-ESP32-C3 (WiFi + BLE)
+ESP32-C3 (WiFi + BLE HID v15d)
     ↕ BLE HID
 手机 / 平板 (被控端)
 ```
 
-## 安全特性 (v5)
+## 安全特性
 
 | 特性 | 说明 |
 |------|------|
@@ -31,11 +31,11 @@ worker/
 ├── package.json          # Node 依赖 (wrangler)
 ├── wrangler.toml         # Cloudflare Worker 配置 + 环境变量
 └── src/
-    └── index.js          # Worker v5 (登录页 + 控制页 + DO 中继)
+    └── index.js          # Worker v7b (登录页 + 控制页 + DO 中继)
 
 esp32/
 └── ble_hid_controller/
-    └── ble_hid_controller.ino   # ESP32-C3 v12 接收端
+    └── ble_hid_controller.ino   # ESP32-C3 v15d 接收端
 ```
 
 ## 快速开始
@@ -86,15 +86,15 @@ npm run deploy
    const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
    ```
 
-4. 选择开发板 **MakerGO ESP32-C3-SUPER-MINI**（或其他 ESP32开发板，推荐使用ESP32-C3-SUPER-MINI），**开启 USB CDC On Boot**，分区方案选择 **Huge APP**，编译上传。
+4. 推荐开发板使用 ESP32-C3-SUPER-MINI，选择开发板 **MakerGO ESP32-C3-SUPER-MINI**，**按需开启 USB CDC On Boot**，分区方案选择 **Huge APP**，编译上传。
 
 5. 打开**串口监视器**（115200 波特率），观察连接状态。预期输出：
    ```
-   ESP32 BLE HID v12 (WebSocket auth)
+   ESP32 BLE HID v15d (+Backspace +Enter)
    [BLE] 广播已启动！
    [WiFi] 已连接, IP: x.x.x.x
    [WS] 开始连接 (含设备令牌)...
-   [STAT] BLE=1 CONN=1 WS=1 ...   ← WS=1 表示 WebSocket 已连接
+   [STAT] BLE=1 ENC=0 CONN=1 WS=1 …   ← WS=1 表示 WebSocket 已连接
    ```
 
 ### 4. 配对被控设备
@@ -111,8 +111,32 @@ npm run deploy
 https://cf-esp32-blehid.你的用户名.workers.dev
 ```
 
-1. 输入登录密码（在 `wrangler.toml` 或 Cloudflare 环境变量中设置）。
-2. 登录成功后进入控制页面，状态显示 **已连接** 即可操控。
+1. 输入登录密码（在 Cloudflare 环境变量中设置）。
+2. 登录成功后进入控制页面，触控板右上角状态指示**已连接**即可操控。
+
+## WEB 控制页面
+
+采用移动端优先 Dark 主题设计，无标题栏避免 iOS 动态缩放：
+
+| 区域 | 说明 |
+|------|------|
+| 正方形触控板 | `aspect-ratio:1`，自适应屏幕尺寸。滑动 = 移动光标，轻点 = 单击 |
+| 状态指示 | 触控板右上角半透明胶囊，显示 BLE 连接状态（未连接 / 连接中 / 已连接） |
+| 操作按钮 | 3×3 Grid 布局，拇指友好 |
+| 速度滑块 | 0.25× ~ 3×，调节光标移动灵敏度 |
+| 文字输入栏 | 底部固定，支持退格/回车按钮辅助编辑，发送后保持焦点 |
+
+### 按钮功能
+
+| 按钮 | 功能 | 指令 |
+|------|------|------|
+| 🏠 桌面 | 返回桌面 (Home) | `h` |
+| ⬅ 返回 | 后退 (Back) | `b` |
+| 🔄 切换 | 应用切换器 (Task View) | `s` |
+| 👆 单击 | 鼠标左键单击 | `c` |
+| 🔓/🔒 拖拽 | 切换拖拽锁定模式 | 切换 `b` 标志 |
+| ⌫ 退格 | 键盘 Backspace | `d` |
+| ↵ 回车 | 键盘 Enter | `e` |
 
 ## 指令协议
 
@@ -124,20 +148,35 @@ Web 页面与 ESP32 之间通过 JSON 通信，Worker Durable Object 中继转�
 | 返回/后退 | `{"a":"b"}` | 消费者控制 Back |
 | 应用切换 | `{"a":"s"}` | Task View + Win+Tab |
 | 单击 | `{"a":"c"}` | 鼠标左键单击 (按下→50ms→释放) |
+| 退格 | `{"a":"d"}` | 键盘 Backspace (按下→30ms→释放) |
+| 回车 | `{"a":"e"}` | 键盘 Enter (按下→30ms→释放) |
 | 鼠标移动 | `{"a":"m","x":dx,"y":dy}` | dx/dy 范围 -127~127 |
 | 拖拽移动 | `{"a":"m","x":dx,"y":dy,"b":1}` | 锁定模式下左键保持按下 |
 | 输入文字 | `{"a":"t","d":"hello"}` | 模拟键盘逐字符输入 (支持 ASCII) |
+
+## BLE 连接管理 (v15)
+
+| 机制 | 说明 |
+|------|------|
+| Keep‑alive | 每 30 秒发送空鼠标报告，维持 BLE 连接活跃 |
+| 死连接检测 | 连续 10 次 `notify()` 失败 → 自动重启 BLE 广播 |
+| 断连超时恢复 | BLE 断开超过 30 秒 → 自动重启广播尝试恢复 |
+| GATT 轮询 | 每秒检查实际连接数，电平触发避免状态死锁 |
 
 ## 版本历史
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
-| v5 (Worker) | 2026-05 | 设备令牌认证、HMAC Cookie 签名、频率限制、惰性清理 |
-| v4 (Worker) | 2026-05 | Cookie HMAC-SHA256 签名、密码版本指纹 |
-| v3 (Worker) | 2026-05 | 密码登录认证、解锁释放鼠标、重复 a 字段修复 |
-| v12 (ESP32) | 2026-05 | 设备令牌查询参数、移除不存在的 setInsecure() |
-| v11 (ESP32) | 2026-05 | 设备令牌认证支持 |
-| v10 (ESP32) | 2026-05 | 类型安全转换 as<uint8_t>()、JSON 容量 512 字节 |
+| v7b (Worker) | 2026-05 | 退格/回车按钮、3×3 网格、输入框保持焦点 |
+| v7a (Worker) | 2026-05 | 移除标题栏消除 iOS 缩放、状态内嵌触控板 |
+| v7 (Worker) | 2026-05 | 移动端优先 UI 重写、正方形触控板、AMOLED Dark 主题 |
+| v6 (Worker) | 2026-05 | DO 转发 URL 剥离 token 参数 |
+| v5 (Worker) | 2026-05 | 设备令牌认证、HMAC Cookie 签名、频率限制 |
+| v15d (ESP32) | 2026-05 | 新增退格 (d) 和回车 (e) 指令 |
+| v15c (ESP32) | 2026-05 | 修复 poll 边沿触发死锁、移除看门狗 |
+| v15b (ESP32) | 2026-05 | 移除 60s 无指令看门狗（误断正常 BLE 连接） |
+| v15 (ESP32) | 2026-05 | 死连接检测、断连超时恢复、Keep‑alive |
+| v14 (ESP32) | 2026-05 | 日志规范化、VERBOSE_CMD 开关 |
 
 ## 常见问题
 
@@ -153,8 +192,11 @@ A: ESP32 上电后约 2-3 秒开始广播，确认串口显示 "BLE HID Service 
 **Q: WebSocket 始终显示未连接 (WS=0)？**
 A: 检查三点——① `DEVICE_SECRET` 环境变量是否与 ESP32 中 `WS_PATH` 的 token 一致；② 域名是否正确；③ 路由器是否允许 443 端口出站。
 
+**Q: 一段时间不操作后手机无反应？**
+A: v15 已修复此问题。若仍出现，检查串口 `[STAT]` 行 BLE= 是否为 1。若为 0 且 CONN=1，可能是加密未完成，等待手机端重新配对。
+
 **Q: 触摸板单击没反应？**
-A: 轻点时间需 < 300ms 且移动距离 < 0.5px，快速轻点有效。也可使用 "单击" 按钮。
+A: 轻点时间需 < 260ms 且移动距离 < 0.3px，快速轻点有效。也可使用 "单击" 按钮。
 
 **Q: 登录提示"尝试次数过多"？**
 A: 密码错误超过 5 次/分钟会触发频率限制，等待 1 分钟后重试。
@@ -162,10 +204,14 @@ A: 密码错误超过 5 次/分钟会触发频率限制，等待 1 分钟后重�
 **Q: 修改密码后旧浏览器如何？**
 A: Cookie 含密码版本指纹，密码变更后旧 Cookie 自动失效，需重新登录。
 
+**Q: 页面在 iPhone 上显示很小？**
+A: v7a 已修复此问题（移除标题栏 + `-webkit-text-size-adjust:100%`）。若仍有问题，尝试刷新页面或清除缓存。
+
 ## 注意事项
 
 - **仅支持单 ESP32**——Durable Object 房间广播给所有已连接的 WebSocket 客户端。
 - ESP32 需保持供电，WiFi 断开会自动重连（30s 检测间隔）。
+- BLE 连接通过 Keep‑alive 维持，闲置不会主动断开。
 - 触摸板支持手机触摸事件和桌面端鼠标拖拽。
 - 桌面端操作：拖拽锁定后滑动触摸板 = 拖拽文件/选区；解锁时自动释放鼠标左键。
 

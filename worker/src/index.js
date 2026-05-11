@@ -1,14 +1,15 @@
 /**
- * Cloudflare Worker - ESP32 BLE HID 遥控器 (v7a + iOS zoom fix)
+ * Cloudflare Worker - ESP32 BLE HID 遥控器 (v7b + 退格/回车按钮)
  *
+ * v7b 新增:
+ *   - UI 新增 ⌫ 退格 (Backspace) 和 ↵ 回车 (Enter) 按钮，3×3 网格布局
+ *   - 调整触控板高度约束以容纳新按钮行
  * v7a 修复:
  *   - 移除左上角标题，消除 iOS Safari 动态缩放
  *   - 状态指示移至触控板内部右上角
  *   - 添加 -webkit-text-size-adjust: 100%
- *   - 触控板最大化利用屏幕空间
  * v7 改进:
  *   - 正方形触控板 (aspect-ratio:1)，自适应屏幕
- *   - 操作按钮 3×2 Grid 布局
  *   - Dark 主题 AMOLED 优化
  */
 
@@ -206,7 +207,7 @@ f.onsubmit=async e=>{
 </body>
 </html>`;
 
-// ==================== 主控制页面 v7a (iOS zoom fix) ====================
+// ==================== 主控制页面 v7b (退格/回车按钮 + iOS zoom fix) ====================
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -265,7 +266,7 @@ body{
 
 /* ===== TOUCHPAD (正方形) ===== */
 .tpad{
-  width:min(calc(100vw - 20px), calc(100dvh - 210px));
+  width:min(calc(100vw - 20px), calc(100dvh - 260px));
   max-width:380px;
   aspect-ratio:1;
   background:radial-gradient(ellipse at center, rgba(99,102,241,.04) 0%, transparent 70%);
@@ -371,6 +372,7 @@ body{
 .btn.accent:active{opacity:.85}
 .btn.danger{color:var(--danger);border-color:rgba(248,113,113,.15)}
 .btn.danger:active{background:rgba(248,113,113,.08)}
+.btn.ctr{grid-column:2/3}
 
 /* ===== SPEED ===== */
 .speed{
@@ -446,7 +448,7 @@ body{
   .speed{max-width:420px}
 }
 @media(max-height:650px){
-  .tpad{width:min(calc(100vw - 20px), calc(100dvh - 180px));max-width:300px}
+  .tpad{width:min(calc(100vw - 20px), calc(100dvh - 230px));max-width:300px}
   .actions{max-width:300px;gap:4px}
   .speed{max-width:300px}
   .btn{padding:8px 3px;font-size:.68rem}
@@ -481,13 +483,15 @@ body{
     <div class="tpad-dot-cursor" id="td"></div>
   </div>
 
-  <!-- ACTION GRID -->
+  <!-- ACTION GRID (3×3, 7 buttons) -->
   <div class="actions">
     <button class="btn" onclick="SC('h')">🏠 桌面</button>
     <button class="btn" onclick="SC('b')">⬅ 返回</button>
     <button class="btn" onclick="SC('s')">🔄 切换</button>
     <button class="btn accent" onclick="SC('c')">👆 单击</button>
     <button class="btn" id="lb" onclick="TL()">🔓 拖拽</button>
+    <button class="btn" onclick="SC('d')">⌫ 退格</button>
+    <button class="btn ctr" onclick="SC('e')">↵ 回车</button>
   </div>
 
   <!-- SPEED -->
@@ -507,7 +511,7 @@ body{
 </div>
 
 <script>
-// DOM (v7a: 移除了 header DOM，状态移至触控板内部)
+// DOM
 var TP=document.getElementById('tp'),TD=document.getElementById('td'),
     TH=document.getElementById('th'),SD=document.getElementById('sd'),
     ST_=document.getElementById('st'),LT=document.getElementById('lt'),
@@ -544,7 +548,7 @@ function SC(a,x){
 }
 function ST(){
   var t=TI.value.trim();if(!t)return;
-  SC('t',{d:t});TI.value='';TI.blur();
+  SC('t',{d:t});TI.value='';TI.focus();
 }
 
 // Drag lock

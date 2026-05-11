@@ -1,6 +1,9 @@
 /*
- * ESP32 BLE HID 遥控器 - C3 v15c (修复 poll 边沿触发死锁)
+ * ESP32 BLE HID 遥控器 - C3 v15d (新增退格/回车指令)
  *
+ * v15d 新增:
+ *   - 'd' 指令: 退格 (Backspace, HID 0x2A)
+ *   - 'e' 指令: 回车 (Enter, HID 0x28)
  * v15c 修复:
  *   - pollBLEConnection: bleConnected 改为跟随实际 count 值，不再依赖边沿触发
  *   - restartBLEAdvertising: 重置 g_prevConnCount，避免状态卡死
@@ -323,6 +326,8 @@ void handleCommand(const char* json) {
               { uint8_t t=0x2B; sendKeyboard(0x08, &t,1); delay(120); releaseKeys(); }
               break;
     case 'c': sendMouse(1,0,0,0); delay(50); sendMouse(0,0,0,0); break;
+    case 'd': { uint8_t k=0x2A; sendKeyboard(0,&k,1); delay(30); releaseKeys(); } break;
+    case 'e': { uint8_t k=0x28; sendKeyboard(0,&k,1); delay(30); releaseKeys(); } break;
     case 'm': {
       int dx = doc["x"]|0, dy = doc["y"]|0;
       uint8_t btn = doc["b"].as<uint8_t>();
@@ -354,7 +359,7 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("\n[SYS] ESP32 BLE HID v15c (poll edge-trigger fix)");
+  Serial.println("\n[SYS] ESP32 BLE HID v15d (+Backspace +Enter)");
   Serial.printf("[SYS] Chip: %s, Flash: %dMB, Heap: %d\n",
     ESP.getChipModel(), ESP.getFlashChipSize()/1048576, ESP.getFreeHeap());
 
