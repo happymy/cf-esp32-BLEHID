@@ -6,3 +6,4 @@ worker/.wrangler/
 .DS_Store
 Thumbs.db
 Desktop.ini
+/esp32/lib
