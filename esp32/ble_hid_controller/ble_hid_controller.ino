@@ -1,17 +1,26 @@
 /*
- * ESP32 BLE HID 遥控器 (接收端)
- * 
- * 功能:
- *  连接 Cloudflare Worker WebSocket，接收指令，
- *  通过 NimBLE 模拟蓝牙键盘/鼠标控制手机。
- * 
- * 依赖库 (Arduino IDE 库管理器安装):
- *  - NimBLE-Arduino      by h2zero
- *  - ArduinoJson         by Benoit Blanchon
- *  - arduinoWebSockets   by Markus Sattler (Links2004)
- * 
- * 配置:
- *  修改下方 WIFI_SSID / WIFI_PASS / WS_HOST 三个宏。
+ * ESP32 BLE HID 遥控器 - C3 v18 (修复 HID 报告数据格式+坐标范围，保留 bonding 自动重连)
+ *
+ * v18 关键修复：
+ *   - [关键] 恢复单输入报告特征 getInputReport(0) 模式：
+ *     v16/v17 三特征独立 Report ID 与 BLE HOGP 规范冲突（报告首字节重复 ID → 数据错位）
+ *     回到 v15 成熟方案：一个特征承载全部 Report ID (0x01/0x02/0x03)，report 数据首字节区分类型
+ *   - [中等] 鼠标坐标 clamp 范围修正为 [-127, 127]，匹配报告描述符 Logical Min/Max
+ *
+ * v17 修复（保留）：
+ *   - 开启 bonding (setSecurityAuth(true, false, true)) → ESP32 重启无需重新配对
+ *   - 手机锁屏唤醒后自动重连已绑定设备（手机端主动扫描已绑定设备并恢复加密）
+ *   - onAuthenticationComplete 回调记录配对/加密状态
+ *
+ * v16 修复（保留）：
+ *   - pServer->start() 在全部 getInputReport() 之后调用，确保特征注册完整
+ *
+ * 库依赖（Arduino IDE 内安装）：
+ *   NimBLE-Arduino v2.5.0 (h2zero)
+ *   ArduinoJson v7.x (Benoit Blanchon)
+ *   arduinoWebSockets (Markus Sattler)
+ *
+ * 开发板：MakerGO ESP32-C3-SUPER-MINI, Partition Scheme = Huge APP
  */
 
 #include <NimBLEDevice.h>
@@ -19,405 +28,348 @@
 #include <NimBLEService.h>
 #include <NimBLEAdvertising.h>
 #include <NimBLEHIDDevice.h>
+#include <NimBLEConnInfo.h>
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 
+// ==================== 日志控制 ====================
+#define VERBOSE_CMD 1
+
 // ==================== 用户配置 ====================
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
-const char* WS_HOST  = "your-worker.workers.dev";   // Cloudflare Worker 域名
+const char* WIFI_SSID = "你的WiFi名";
+const char* WIFI_PASS = "你的WiFi密码";
+const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";   // Cloudflare Worker 域名
 const int   WS_PORT  = 443;
-const char* WS_PATH  = "/ws";
+const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
 
 // ==================== BLE HID 常量 ====================
-#define BLE_DEVICE_NAME    "ESP32 BLE HID"
+#define BLE_DEVICE_NAME    "ESP32 BLE Remote"
 #define REPORT_ID_KEYBOARD 1
 #define REPORT_ID_MOUSE    2
 #define REPORT_ID_CONSUMER 3
 
-// 消费者控制码 (Usage Page 0x0C)
 #define AC_HOME      0x0223
 #define AC_BACK      0x0224
-#define AC_TASK_VIEW 0x0296   // 部分 Android 设备支持
+#define AC_TASK_VIEW 0x0296
 
-// HID 报告描述符 (键盘 + 鼠标 + 消费者控制)
+// 报告描述符（键盘 + 鼠标 + 消费者控制 —— 与 v15 完全一致）
 static const uint8_t HID_REPORT_MAP[] PROGMEM = {
+  0x05,0x01,0x09,0x02,0xA1,0x01,0x85,0x02,0x09,0x01,
+  0xA1,0x00,0x05,0x09,0x19,0x01,0x29,0x03,0x15,0x00,
+  0x25,0x01,0x95,0x03,0x75,0x01,0x81,0x02,0x95,0x01,
+  0x75,0x05,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,
+  0x09,0x38,0x15,0x81,0x25,0x7F,0x75,0x08,0x95,0x03,
+  0x81,0x06,0xC0,0xC0,
 
-  // ---- 鼠标 (Report ID 2) ----
-  0x05, 0x01,        // Usage Page (Generic Desktop)
-  0x09, 0x02,        // Usage (Mouse)
-  0xA1, 0x01,        // Collection (Application)
-  0x85, 0x02,        //   Report ID (2)
-  0x09, 0x01,        //   Usage (Pointer)
-  0xA1, 0x00,        //   Collection (Physical)
-  0x05, 0x09,        //     Usage Page (Button)
-  0x19, 0x01,        //     Usage Minimum (1)
-  0x29, 0x03,        //     Usage Maximum (3)
-  0x15, 0x00,        //     Logical Minimum (0)
-  0x25, 0x01,        //     Logical Maximum (1)
-  0x95, 0x03,        //     Report Count (3)
-  0x75, 0x01,        //     Report Size (1)
-  0x81, 0x02,        //     Input (Data,Var,Abs)       - buttons
-  0x95, 0x01,        //     Report Count (1)
-  0x75, 0x05,        //     Report Size (5)
-  0x81, 0x01,        //     Input (Const)              - padding
-  0x05, 0x01,        //     Usage Page (Generic Desktop)
-  0x09, 0x30,        //     Usage (X)
-  0x09, 0x31,        //     Usage (Y)
-  0x09, 0x38,        //     Usage (Wheel)
-  0x15, 0x81,        //     Logical Minimum (-127)
-  0x25, 0x7F,        //     Logical Maximum (127)
-  0x75, 0x08,        //     Report Size (8)
-  0x95, 0x03,        //     Report Count (3)
-  0x81, 0x06,        //     Input (Data,Var,Rel)       - x, y, wheel
-  0xC0,              //   End Collection
-  0xC0,              // End Collection
+  0x05,0x01,0x09,0x06,0xA1,0x01,0x85,0x01,0x05,0x07,
+  0x19,0xE0,0x29,0xE7,0x15,0x00,0x25,0x01,0x75,0x01,
+  0x95,0x08,0x81,0x02,0x95,0x01,0x75,0x08,0x81,0x01,
+  0x95,0x05,0x75,0x01,0x05,0x08,0x19,0x01,0x29,0x05,
+  0x91,0x02,0x95,0x01,0x75,0x03,0x91,0x01,0x95,0x06,
+  0x75,0x08,0x15,0x00,0x25,0x65,0x05,0x07,0x19,0x00,
+  0x29,0x65,0x81,0x00,0xC0,
 
-  // ---- 键盘 (Report ID 1) ----
-  0x05, 0x01,        // Usage Page (Generic Desktop)
-  0x09, 0x06,        // Usage (Keyboard)
-  0xA1, 0x01,        // Collection (Application)
-  0x85, 0x01,        //   Report ID (1)
-  0x05, 0x07,        //   Usage Page (Keyboard)
-  0x19, 0xE0,        //   Usage Minimum (224)          - Left Ctrl
-  0x29, 0xE7,        //   Usage Maximum (231)          - Right GUI
-  0x15, 0x00,        //   Logical Minimum (0)
-  0x25, 0x01,        //   Logical Maximum (1)
-  0x75, 0x01,        //   Report Size (1)
-  0x95, 0x08,        //   Report Count (8)
-  0x81, 0x02,        //   Input (Data,Var,Abs)         - modifier byte
-  0x95, 0x01,        //   Report Count (1)
-  0x75, 0x08,        //   Report Size (8)
-  0x81, 0x01,        //   Input (Const)                - reserved byte
-  0x95, 0x05,        //   Report Count (5)
-  0x75, 0x01,        //   Report Size (1)
-  0x05, 0x08,        //   Usage Page (LEDs)
-  0x19, 0x01,        //   Usage Minimum (1)
-  0x29, 0x05,        //   Usage Maximum (5)
-  0x91, 0x02,        //   Output (Data,Var,Abs)        - LED report
-  0x95, 0x01,        //   Report Count (1)
-  0x75, 0x03,        //   Report Size (3)
-  0x91, 0x01,        //   Output (Const)               - padding
-  0x95, 0x06,        //   Report Count (6)             - up to 6 keys
-  0x75, 0x08,        //   Report Size (8)
-  0x15, 0x00,        //   Logical Minimum (0)
-  0x25, 0x65,        //   Logical Maximum (101)
-  0x05, 0x07,        //   Usage Page (Keyboard)
-  0x19, 0x00,        //   Usage Minimum (0)
-  0x29, 0x65,        //   Usage Maximum (101)
-  0x81, 0x00,        //   Input (Data,Array)
-  0xC0,              // End Collection
-
-  // ---- 消费者控制 (Report ID 3) ----
-  0x05, 0x0C,        // Usage Page (Consumer Devices)
-  0x09, 0x01,        // Usage (Consumer Control)
-  0xA1, 0x01,        // Collection (Application)
-  0x85, 0x03,        //   Report ID (3)
-  0x15, 0x01,        //   Logical Minimum (1)
-  0x26, 0x9C, 0x02,  //   Logical Maximum (668)
-  0x19, 0x01,        //   Usage Minimum (1)
-  0x2A, 0x9C, 0x02,  //   Usage Maximum (668)
-  0x75, 0x10,        //   Report Size (16)
-  0x95, 0x01,        //   Report Count (1)
-  0x81, 0x00,        //   Input (Data,Array,Abs)
-  0xC0               // End Collection
+  0x05,0x0C,0x09,0x01,0xA1,0x01,0x85,0x03,0x15,0x01,
+  0x26,0x9C,0x02,0x19,0x01,0x2A,0x9C,0x02,0x75,0x10,
+  0x95,0x01,0x81,0x00,0xC0
 };
 
 // ==================== 全局对象 ====================
 NimBLEServer*         pServer       = nullptr;
 NimBLEHIDDevice*      pHID          = nullptr;
-NimBLECharacteristic* pInputReport  = nullptr;
-NimBLECharacteristic* pBootKbdIn    = nullptr;
-NimBLECharacteristic* pBootMouseIn  = nullptr;
+NimBLECharacteristic* pInputReport  = nullptr;   // v18: 单一输入报告特征 (Report ID 0 → 数据含 Report ID 前缀)
+WebSocketsClient      webSocket;
 
-WebSocketsClient webSocket;
+bool bleConnected   = false;
+bool bleEncrypted   = false;
+bool bleBonded      = false;
+bool hidReady       = false;
+bool wsConnected    = false;
 
-bool bleConnected = false;
-bool wsConnected  = false;
+// 统计
+uint32_t g_notifyCount    = 0;
+uint32_t g_notifyFail     = 0;
+uint32_t g_bleDisconnects = 0;
+uint32_t g_cmdCount       = 0;
+uint32_t g_cmdSkipped     = 0;
 
-// ==================== BLE 连接回调 ====================
+uint32_t g_lastKeepAlive  = 0;
+
+// ==================== BLE 回调（v17: onAuthenticationComplete）====================
 class ServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s) override {
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
+    Serial.println("[BLE] Connected");
     bleConnected = true;
-    Serial.println("[BLE] 已连接");
-    NimBLEDevice::startAdvertising();  // 允许后续重连
   }
-  void onDisconnect(NimBLEServer* s) override {
+
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
+    Serial.printf("[BLE] Disconnected (reason=%d), restart advertising\n", reason);
     bleConnected = false;
-    Serial.println("[BLE] 断开，重新广播...");
+    bleEncrypted = false;
+    bleBonded    = false;
+    g_bleDisconnects++;
     NimBLEDevice::startAdvertising();
+  }
+
+  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+    bleEncrypted = connInfo.isEncrypted();
+    bleBonded    = connInfo.isBonded();
+    Serial.printf("[SEC] Encryption %s, bonded=%d\n",
+      bleEncrypted ? "enabled" : "not enabled",
+      bleBonded);
   }
 };
 
-// ==================== WiFi ====================
-bool connectWiFi() {
-  Serial.print("[WiFi] 连接中: ");
-  Serial.println(WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 40) {
-    delay(500);
-    Serial.print(".");
-    retry++;
-  }
-  bool ok = (WiFi.status() == WL_CONNECTED);
-  if (ok) {
-    Serial.println("\n[WiFi] 已连接, IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\n[WiFi] 连接失败!");
-  }
-  return ok;
-}
-
-// ==================== BLE HID 初始化 ====================
+// ==================== BLE 初始化 ====================
 void setupBLE() {
+  Serial.println("[BLE] Init ...");
+
   NimBLEDevice::init(BLE_DEVICE_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // 最大发射功率
+  Serial.printf("[BLE] MAC: %s\n", NimBLEDevice::getAddress().toString().c_str());
+
+  // v17: 严格参照库示例，开启 bonding
+  NimBLEDevice::setSecurityAuth(true, false, true);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  Serial.println("[BLE] Security: bonding=ON, MITM=OFF, SC=ON (Just Works)");
+
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCB());
 
   pHID = new NimBLEHIDDevice(pServer);
-  pHID->reportMap((uint8_t*)HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
-  pInputReport  = pHID->inputReport(0);          // 主输入（不带独立 ID）
-  pBootKbdIn    = pHID->bootKeyboardInput();     // 兼容启动协议
-  pBootMouseIn  = pHID->bootMouseInput();        // 兼容启动协议
-  pHID->hidInfo(0x00, 0x02);                    // 国家代码 0, 远程唤醒 + 正常可连接
-  pHID->pnp(0x02, 0xE502, 0xA111, 0x0110);     // 厂商自定义
-  pHID->manufacturer()->setValue("ESP32");
-  pHID->startServices();
+  pHID->setReportMap((uint8_t*)HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
+  pHID->setHidInfo(0x00, 0x00);
+  pHID->setManufacturer("ESP32-C3");
 
-  // 广播参数
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->setAppearance(0x03C0);                    // 键盘外观
-  adv->addServiceUUID(pHID->hidService()->getUUID());
-  adv->setScanResponse(true);
-  adv->start();
+  // v18: 恢复单输入报告特征，Report ID 0 → 数据首字节区分报告类型 (1/2/3)
+  pInputReport = pHID->getInputReport(0);
+  hidReady = (pInputReport != nullptr);
+  Serial.printf("[BLE] HID ready: %d\n", hidReady);
 
-  Serial.println("[BLE] HID 服务已启动, 等待连接...");
+  // 所有特征创建完毕后启动服务
+  pServer->start();
+
+  NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+  pAdv->setName(BLE_DEVICE_NAME);
+  pAdv->setAppearance(0x03C0);
+  pAdv->addServiceUUID(pHID->getHidService()->getUUID());
+  pAdv->start();
+  Serial.println("[BLE] Advertising started");
 }
 
-// ==================== 底层报告发送 ====================
+// ==================== HID 发送（v18: 统一通过单特征发送，首字节为 Report ID）====================
 void sendHIDReport(const uint8_t* data, size_t len) {
-  if (!bleConnected) return;
+  if (!bleConnected || !pInputReport || !hidReady) return;
   pInputReport->setValue(data, len);
-  pInputReport->notify();
-  delay(5);
+  if (pInputReport->notify()) {
+    g_notifyCount++;
+  } else {
+    g_notifyFail++;
+  }
+  delay(2);
 }
 
-void sendKeyboard(uint8_t modifiers, const uint8_t* keys, uint8_t numKeys) {
-  // 标准键盘报告：Report ID + modifier + reserved + 6 key slots
-  uint8_t report[9];
-  report[0] = REPORT_ID_KEYBOARD;
-  report[1] = modifiers;
-  report[2] = 0;
-  for (int i = 0; i < 6; i++) report[3 + i] = (i < numKeys) ? keys[i] : 0;
-  sendHIDReport(report, 9);
-
-  // 同步写 Boot Keyboard 以便不支持报告 ID 的主机使用
-  uint8_t boot[8] = {modifiers, 0, 0, 0, 0, 0, 0, 0};
-  for (int i = 0; i < numKeys && i < 6; i++) boot[2 + i] = keys[i];
-  pBootKbdIn->setValue(boot, 8);
-  pBootKbdIn->notify();
+void sendKeyboard(uint8_t mod, const uint8_t* keys, uint8_t count) {
+  uint8_t r[9] = {REPORT_ID_KEYBOARD, mod, 0};
+  for (int i = 0; i < 6; i++) r[3 + i] = (i < count) ? keys[i] : 0;
+  sendHIDReport(r, 9);
 }
 
-void releaseAllKeys() {
-  sendKeyboard(0, nullptr, 0);
+void releaseKeys() {
+  uint8_t z[9] = {0};
+  z[0] = REPORT_ID_KEYBOARD;
+  sendHIDReport(z, 9);
 }
 
-void sendMouse(uint8_t buttons, int8_t x, int8_t y, int8_t wheel) {
-  uint8_t report[5];
-  report[0] = REPORT_ID_MOUSE;
-  report[1] = buttons;
-  report[2] = x;
-  report[3] = y;
-  report[4] = wheel;
-  sendHIDReport(report, 5);
-
-  uint8_t boot[3] = {buttons, x, y};
-  pBootMouseIn->setValue(boot, 3);
-  pBootMouseIn->notify();
+void sendMouse(uint8_t btn, int8_t x, int8_t y, int8_t w) {
+  uint8_t r[5] = {REPORT_ID_MOUSE, btn, (uint8_t)x, (uint8_t)y, (uint8_t)w};
+  sendHIDReport(r, 5);
 }
 
 void sendConsumer(uint16_t usage) {
-  uint8_t report[3];
-  report[0] = REPORT_ID_CONSUMER;
-  report[1] = usage & 0xFF;
-  report[2] = (usage >> 8) & 0xFF;
-  sendHIDReport(report, 3);
-  delay(50);
-  // 立即释放
-  uint8_t release[3] = {REPORT_ID_CONSUMER, 0, 0};
-  sendHIDReport(release, 3);
+  uint8_t r[3] = {REPORT_ID_CONSUMER, (uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8)};
+  sendHIDReport(r, 3);
+  delay(40);
+  uint8_t z[3] = {REPORT_ID_CONSUMER, 0, 0};  // Usage = 0 表示释放
+  sendHIDReport(z, 3);
 }
 
 // ==================== 文字输入 ====================
-static uint8_t asciiToHID(char c) {
-  if (c >= 'a' && c <= 'z') return c - 'a' + 0x04;
-  if (c >= 'A' && c <= 'Z') return c - 'A' + 0x04;
-  if (c >= '1' && c <= '9') return c - '1' + 0x1E;
-  if (c == '0') return 0x27;
+uint8_t asciiToHID(char c) {
+  if (c >= 'a' && c <= 'z') return c - 'a' + 4;
+  if (c >= 'A' && c <= 'Z') return c - 'A' + 4;
+  if (c >= '1' && c <= '9') return c - '1' + 30;
+  if (c == '0') return 39;
   switch (c) {
-    case ' ':  return 0x2C;
-    case '\n': case '\r': return 0x28;
-    case '-': case '_': return 0x2D;
-    case '=': case '+': return 0x2E;
-    case '[': case '{': return 0x2F;
-    case ']': case '}': return 0x30;
-    case '\\': case '|': return 0x31;
-    case ';': case ':': return 0x33;
-    case '\'': case '"': return 0x34;
-    case '`': case '~': return 0x35;
-    case ',': case '<': return 0x36;
-    case '.': case '>': return 0x37;
-    case '/': case '?': return 0x38;
-    case '\t': return 0x2B;
-    default:   return 0x00;   // 不支持的字符
+    case ' ': return 44;           case '\n': case '\r': return 40;
+    case '-': case '_': return 45; case '=': case '+': return 46;
+    case '[': case '{': return 47; case ']': case '}': return 48;
+    case '\\': case '|': return 49;case ';': case ':': return 51;
+    case '\'': case '"': return 52;case '`': case '~': return 53;
+    case ',': case '<': return 54; case '.': case '>': return 55;
+    case '/': case '?': return 56; case '\t': return 43;
+    default: return 0;
   }
 }
 
-static bool needsShift(char c) {
+bool needsShift(char c) {
   if (c >= 'A' && c <= 'Z') return true;
   switch (c) {
-    case '!': case '@': case '#': case '$': case '%':
-    case '^': case '&': case '*': case '(': case ')':
-    case '_': case '+': case '{': case '}': case '|':
-    case ':': case '"': case '~': case '<': case '>':
-    case '?': return true;
+    case '!': case '@': case '#': case '$': case '%': case '^': case '&':
+    case '*': case '(': case ')': case '_': case '+': case '{': case '}':
+    case '|': case ':': case '"': case '~': case '<': case '>': case '?':
+      return true;
   }
   return false;
 }
 
+#define MAX_TYPE_STRING_LEN 200
 void typeString(const char* text) {
-  for (size_t i = 0; text[i]; i++) {
+  for (int i = 0; text[i] && i < MAX_TYPE_STRING_LEN; i++) {
     uint8_t code = asciiToHID(text[i]);
-    if (code == 0) continue;
-    uint8_t mod = needsShift(text[i]) ? 0x02 : 0;   // Left Shift
-    sendKeyboard(mod, &code, 1);
+    if (!code) continue;
+    sendKeyboard(needsShift(text[i]) ? 0x02 : 0, &code, 1);
     delay(25);
-    releaseAllKeys();
+    releaseKeys();
     delay(15);
   }
 }
 
 // ==================== 指令处理 ====================
 void handleCommand(const char* json) {
-  StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, json)) {
-    Serial.println("[CMD] JSON 解析失败");
-    return;
-  }
-
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, json)) return;
   const char* a = doc["a"];
   if (!a) return;
 
-  Serial.printf("[CMD] %s\n", a);
+  g_cmdCount++;
+
+  #if VERBOSE_CMD
+    Serial.printf("[CMD] #%u: %s", g_cmdCount, a);
+    if (doc.containsKey("x")) Serial.printf(" x=%d", doc["x"].as<int>());
+    if (doc.containsKey("y")) Serial.printf(" y=%d", doc["y"].as<int>());
+    if (doc.containsKey("b")) Serial.printf(" btn=%d", doc["b"].as<int>());
+    if (doc.containsKey("d")) Serial.printf(" d=\"%.20s\"", doc["d"].as<const char*>());
+    Serial.println();
+  #endif
+
+  if (!hidReady) { g_cmdSkipped++; return; }
+  if (!bleConnected) { g_cmdSkipped++; return; }
 
   switch (a[0]) {
-    // --- 返回桌面 ---
-    case 'h':
-      sendConsumer(AC_HOME);
-      break;
-
-    // --- 返回 / 后退 ---
-    case 'b':
-      sendConsumer(AC_BACK);
-      break;
-
-    // --- 应用切换 ---
-    case 's': {
-      // 方式1: 消费者 Task View (部分设备支持)
-      sendConsumer(AC_TASK_VIEW);
-      delay(80);
-      // 方式2: 左 GUI + Tab (大多数 Android 设备的通用后备方案)
-      uint8_t tab = 0x2B;
-      sendKeyboard(0x08, &tab, 1);   // Left GUI
-      delay(120);
-      releaseAllKeys();
-      break;
-    }
-
-    // --- 单击 ---
-    case 'c':
-      sendMouse(0x01, 0, 0, 0);      // 左键按下
-      delay(50);
-      sendMouse(0x00, 0, 0, 0);      // 释放
-      break;
-
-    // --- 鼠标移动 ---
+    case 'h': sendConsumer(AC_HOME); break;
+    case 'b': sendConsumer(AC_BACK); break;
+    case 's': sendConsumer(AC_TASK_VIEW); delay(80);
+              { uint8_t k = 0x2B; sendKeyboard(0x08, &k, 1); delay(120); releaseKeys(); }
+              break;
+    case 'c': sendMouse(1,0,0,0); delay(50); sendMouse(0,0,0,0); break;
+    case 'd': { uint8_t k = 0x2A; sendKeyboard(0, &k, 1); delay(30); releaseKeys(); } break;
+    case 'e': { uint8_t k = 0x28; sendKeyboard(0, &k, 1); delay(30); releaseKeys(); } break;
     case 'm': {
-      int dx = doc["x"] | 0;
-      int dy = doc["y"] | 0;
-      if (dx >  127) dx =  127;
-      if (dx < -127) dx = -127;
-      if (dy >  127) dy =  127;
-      if (dy < -127) dy = -127;
-      sendMouse(0x00, (int8_t)dx, (int8_t)dy, 0);
+      long dx = doc["x"] | 0L, dy = doc["y"] | 0L;
+      uint8_t btn = doc["b"].as<uint8_t>();
+      // v18: 修正 clamp 范围 [-127, 127]，匹配报告描述符 Logical Min/Max
+      if (dx > 127) dx = 127; if (dx < -127) dx = -127;
+      if (dy > 127) dy = 127; if (dy < -127) dy = -127;
+      sendMouse(btn, (int8_t)dx, (int8_t)dy, 0);
       break;
     }
-
-    // --- 输入文字 ---
-    case 't': {
-      const char* text = doc["d"];
-      if (text) typeString(text);
-      break;
-    }
+    case 't': if (doc.containsKey("d")) typeString(doc["d"]); break;
   }
 }
 
-// ==================== WebSocket 事件 ====================
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+// ==================== WebSocket ====================
+void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
-    case WStype_DISCONNECTED:
-      Serial.println("[WS] 断开");
-      wsConnected = false;
-      break;
+    case WStype_DISCONNECTED: wsConnected = false; break;
     case WStype_CONNECTED:
-      Serial.println("[WS] 已连接");
       wsConnected = true;
+      Serial.println("[WS] Connected");
       break;
-    case WStype_TEXT:
-      handleCommand((char*)payload);
-      break;
-    case WStype_ERROR:
-      Serial.println("[WS] 错误");
-      wsConnected = false;
-      break;
-    default:
-      break;
+    case WStype_TEXT: handleCommand((char*)payload); break;
+    case WStype_ERROR: wsConnected = false; break;
+    default: break;
   }
 }
 
-// ==================== 主程序 ====================
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n=== ESP32 BLE HID 遥控器 ===");
-
-  if (!connectWiFi()) {
-    delay(3000);
+// ==================== WiFi ====================
+void connectWiFiBlocking() {
+  Serial.print("[WiFi] Connecting to "); Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 40) {
+    delay(500); Serial.print("."); retry++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WiFi] Connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\n[WiFi] Failed!");
     ESP.restart();
   }
-
-  setupBLE();
-
-  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-  // 个人项目跳过证书校验，如需严格安全请部署根证书
-  webSocket.setInsecure();
 }
 
+// ==================== setup ====================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println();
+  Serial.println("[SYS] ESP32 BLE HID v18 (single HID report, bonding, fixed report format)");
+  Serial.printf("[SYS] Chip: %s, Heap: %u\n", ESP.getChipModel(), ESP.getFreeHeap());
+
+  setupBLE();
+  connectWiFiBlocking();
+
+  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+  webSocket.onEvent(onWsEvent);
+  webSocket.setReconnectInterval(3000);
+  Serial.println("[WS] Connecting ...");
+
+  g_lastKeepAlive = millis();
+  Serial.println("[SYS] Ready.");
+}
+
+// ==================== loop ====================
 void loop() {
   webSocket.loop();
 
-  // 定期检查 WiFi
-  static unsigned long lastCheck = 0;
-  if (millis() - lastCheck > 15000) {
-    lastCheck = millis();
+  // 内存监控
+  static unsigned long lastHeapCheck = 0;
+  if (millis() - lastHeapCheck > 30000) {
+    lastHeapCheck = millis();
+    size_t free = ESP.getFreeHeap();
+    if (free < 20000) {
+      Serial.printf("[MEM] Low heap (%u), restarting\n", free);
+      ESP.restart();
+    }
+  }
+
+  // Keep‑alive
+  if (bleConnected && millis() - g_lastKeepAlive > 30000) {
+    g_lastKeepAlive = millis();
+    uint8_t zero[5] = {REPORT_ID_MOUSE, 0, 0, 0, 0};
+    sendHIDReport(zero, 5);
+  }
+
+  // 状态摘要
+  static unsigned long lastStatus = 0;
+  if (millis() - lastStatus > 15000) {
+    lastStatus = millis();
+    Serial.printf("[STAT] BLE=%d ENC=%d BOND=%d WS=%d Ok=%u Fail=%u Disc=%u Cmd=%u Skip=%u Heap=%u\n",
+      bleConnected,
+      bleEncrypted,
+      bleBonded,
+      wsConnected,
+      g_notifyCount, g_notifyFail, g_bleDisconnects,
+      g_cmdCount, g_cmdSkipped,
+      ESP.getFreeHeap());
+  }
+
+  // WiFi 自动重连
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 30000) {
+    lastWifiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] 连接丢失，重连...");
+      Serial.println("[WiFi] Reconnecting ...");
       WiFi.reconnect();
     }
   }
