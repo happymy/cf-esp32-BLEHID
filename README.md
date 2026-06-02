@@ -1,17 +1,17 @@
 # ESP32 BLE HID 遥控器
 
-通过 Cloudflare Worker 部署的安全网页，实时发送指令到 ESP32-C3，ESP32 以蓝牙 HID 模拟键盘/鼠标操控手机。
+通过 Cloudflare Worker 部署的安全网页，实时发送指令到多台 ESP32-C3，ESP32 以蓝牙 HID 模拟键盘/鼠标操控手机。支持多设备在线切换。
 
 ## 架构
 
 ```
-浏览器 (登录 → Web 控制页面 · 移动端优先 Dark UI)
+浏览器 (登录 → Web 控制页面 · 多设备切换 · 移动端优先 Dark UI)
     ↕ WebSocket (Cookie 认证)
-Cloudflare Worker (Durable Object 中继)
+Cloudflare Worker (Durable Object 多设备路由中继)
     ↕ WebSocket (设备令牌认证 ?token=xxx)
-ESP32-C3 (WiFi + BLE HID v18)
+ESP32-C3 #1 ~ #N (WiFi + BLE HID v19)
     ↕ BLE HID
-手机 / 平板 (被控端)
+手机 / 平板 #1 ~ #N (被控端)
 ```
 
 ## 安全特性
@@ -31,11 +31,11 @@ worker/
 ├── package.json          # Node 依赖 (wrangler)
 ├── wrangler.toml         # Cloudflare Worker 配置 + 环境变量
 └── src/
-    └── index.js          # Worker v7b (登录页 + 控制页 + DO 中继)
+    └── index.js          # Worker v8 (登录页 + 控制页 + DO 多设备路由)
 
 esp32/
 └── ble_hid_controller/
-    └── ble_hid_controller.ino   # ESP32-C3 v18 接收端
+    └── ble_hid_controller.ino   # ESP32-C3 v19 接收端 (register + heartbeat)
 ```
 
 ## 快速开始
@@ -90,13 +90,14 @@ npm run deploy
 
 5. 打开**串口监视器**（115200 波特率），观察连接状态。预期输出：
    ```
-   ESP32 BLE HID v18 (single HID report, bonding + auto-reconnect)
+   ESP32 BLE HID v19 (multi-device, register+heartbeat)
+   [SYS] DeviceID: xx:xx:xx:xx:xx:xx
+   [SYS] DeviceName: ESP32 BLE Remote (xx:xx:xx:xx:xx:xx)
    [BLE] MAC: ...
    [BLE] Security: bonding=ON, MITM=OFF, SC=ON (Just Works)
    [BLE] HID ready: 1
    [BLE] Advertising started
    [WiFi] Connected, IP: x.x.x.x
-   [SEC] Encryption enabled, bonded=1
    [WS] Connected
    [STAT] BLE=1 ENC=1 BOND=1 WS=1 Ok=… Fail=… Disc=… Cmd=… Skip=… Heap=…
    ```
@@ -116,7 +117,23 @@ https://cf-esp32-blehid.你的用户名.workers.dev
 ```
 
 1. 输入登录密码（在 Cloudflare 环境变量中设置）。
-2. 登录成功后进入控制页面，触控板右上角状态指示**已连接**即可操控。
+2. 登录成功后进入控制页面，顶部显示**设备选择器**，选择目标设备后触控板右上角状态指示**已连接**即可操控。
+
+## 多设备支持 (v19)
+
+每个 ESP32 上线时通过 `register` 消息向 Worker 注册（deviceId = MAC 地址），并每 15 秒发送 `heartbeat` 维持在线状态。
+
+| 机制 | 说明 |
+|------|------|
+| **设备注册** | ESP32 WebSocket 连接后自动发送 `{"type":"register","deviceId":"MAC","deviceName":"..."}` |
+| **心跳维持** | 每 15 秒发送 `{"type":"heartbeat",...}`，携带 BLE 连接状态 + 统计信息 |
+| **设备发现** | 浏览器 WebSocket 连接后请求 `{"type":"list-devices"}`，DO 广播全部在线设备 |
+| **指令路由** | 控制指令附带 `"to":"设备MAC"` 字段，DO 精准转发到指定设备的 WebSocket |
+| **离线通知** | 设备断开时 DO 广播 `{"type":"device-offline","deviceId":"MAC"}`，UI 移除该设备 |
+| **去重替换** | 相同 deviceId 再次注册时关闭旧 WebSocket 连接（支持重启/断线重连） |
+| **设备选择器** | 页面顶部下拉框列出全部在线设备（🟢 在线 / 🔴 离线 + BLE 连接状态） |
+
+> **多 ESP32 部署**：每台 ESP32 使用相同的 `DEVICE_SECRET` 令牌即可。各自 MAC 地址自动作为唯一 deviceId，同令牌下所有设备归入同一 DO 房间。
 
 ## WEB 控制页面
 
@@ -124,8 +141,9 @@ https://cf-esp32-blehid.你的用户名.workers.dev
 
 | 区域 | 说明 |
 |------|------|
+| 设备选择器 | 顶部固定栏，下拉框列出全部在线设备 + 在线指示器 (🟢/🔴 + BLE 状态) |
 | 正方形触控板 | `aspect-ratio:1`，自适应屏幕尺寸。滑动 = 移动光标，轻点 = 单击 |
-| 状态指示 | 触控板右上角半透明胶囊，显示 BLE 连接状态（未连接 / 连接中 / 已连接） |
+| 状态指示 | 触控板右上角半透明胶囊，显示 WebSocket 连接状态（未连接 / 连接中 / 已连接） |
 | 操作按钮 | 3×3 Grid 布局，拇指友好 |
 | 速度滑块 | 0.25× ~ 3×，调节光标移动灵敏度 |
 | 文字输入栏 | 底部固定，支持退格/回车按钮辅助编辑，发送后保持焦点 |
@@ -148,17 +166,17 @@ Web 页面与 ESP32 之间通过 JSON 通信，Worker Durable Object 中继转�
 
 | 操作 | JSON | 说明 |
 |------|------|------|
-| 返回桌面 | `{"a":"h"}` | 消费者控制 Home |
-| 返回/后退 | `{"a":"b"}` | 消费者控制 Back |
-| 应用切换 | `{"a":"s"}` | Task View + Win+Tab |
-| 单击 | `{"a":"c"}` | 鼠标左键单击 (按下→50ms→释放) |
-| 退格 | `{"a":"d"}` | 键盘 Backspace (按下→30ms→释放) |
-| 回车 | `{"a":"e"}` | 键盘 Enter (按下→30ms→释放) |
-| 鼠标移动 | `{"a":"m","x":dx,"y":dy}` | dx/dy 范围 -127~127 |
-| 拖拽移动 | `{"a":"m","x":dx,"y":dy,"b":1}` | 锁定模式下左键保持按下 |
-| 输入文字 | `{"a":"t","d":"hello"}` | 模拟键盘逐字符输入 (支持 ASCII) |
+| 返回桌面 | `{"a":"h","to":"MAC"}` | 消费者控制 Home (v19+ 含 to 字段) |
+| 返回/后退 | `{"a":"b","to":"MAC"}` | 消费者控制 Back |
+| 应用切换 | `{"a":"s","to":"MAC"}` | Task View + Win+Tab |
+| 单击 | `{"a":"c","to":"MAC"}` | 鼠标左键单击 (按下→50ms→释放) |
+| 退格 | `{"a":"d","to":"MAC"}` | 键盘 Backspace (按下→30ms→释放) |
+| 回车 | `{"a":"e","to":"MAC"}` | 键盘 Enter (按下→30ms→释放) |
+| 鼠标移动 | `{"a":"m","x":dx,"y":dy,"to":"MAC"}` | dx/dy 范围 -127~127 |
+| 拖拽移动 | `{"a":"m","x":dx,"y":dy,"b":1,"to":"MAC"}` | 锁定模式下左键保持按下 |
+| 输入文字 | `{"a":"t","d":"hello","to":"MAC"}` | 模拟键盘逐字符输入 (支持 ASCII) |
 
-## BLE 连接管理 (v18)
+## BLE 连接管理
 
 | 机制 | 说明 |
 |------|------|
@@ -177,6 +195,8 @@ Web 页面与 ESP32 之间通过 JSON 通信，Worker Durable Object 中继转�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v19 (ESP32) | 2026-06 | 多设备支持：register 注册 + heartbeat 心跳 + MAC 地址设备标识 |
+| v8 (Worker) | 2026-06 | 多设备路由：DO 设备管理 + to 字段指令路由 + UI 设备选择器 + 在线指示器 |
 | v18 (ESP32) | 2026-05 | 修复 HOGP 报告格式 Bug（三特征→单特征 getInputReport(0)，消除数据一字节错位）；鼠标坐标 clamp 修正为 [-127,127] |
 | v17 (ESP32) | 2026-05 | 开启 bonding 实现自动重连：重启无需重新配对，锁屏后自动恢复；GATT 三特征分离修复 |
 | v16 (ESP32) | 2026-05 | 彻底重写：关闭 bonding，照抄官方示例回调，移除所有自定义 BLE 恢复逻辑 |
@@ -232,9 +252,12 @@ A: v7a 已修复此问题（移除标题栏 + `-webkit-text-size-adjust:100%`）
 **Q: ESP32 重启后手机需要重新配对？**
 A: v18 已开启 bonding，首次配对后 LTK/IRK 存储于手机安全芯片和 ESP32 NVS。重启后手机凭 MAC 地址识别设备，自动恢复加密，无需重新配对。如需清除绑定信息，在手机蓝牙设置中"忽略此设备"即可。
 
+**Q: 如何添加多台 ESP32？**
+A: 每台 ESP32 使用相同的 `DEVICE_SECRET` 令牌烧录固件，各自 MAC 地址自动作为唯一 deviceId。全部上线后，控制页面顶部设备选择器列出所有设备，下拉切换即可操控不同手机。
+
 ## 注意事项
 
-- **仅支持单 ESP32**——Durable Object 房间广播给所有已连接的 WebSocket 客户端。
+- **支持多 ESP32 同时在线**——Durable Object 通过 `to` 字段精准路由指令到指定设备，设备选择器下拉切换。
 - ESP32 需保持供电，WiFi 断开会自动重连（30s 检测间隔）。
 - BLE 连接通过 bonding + Keep‑alive（30s 空报告）维持，重启或锁屏后自动恢复，无需重新配对。
 - 若手机端操作无响应，检查数据是否因 HOGP 报告格式不一致而错位——v18 已通过单特征 getInputReport(0) 从根源解决。

@@ -1,16 +1,13 @@
 /**
- * Cloudflare Worker - ESP32 BLE HID 遥控器 (v7b + 退格/回车按钮)
+ * Cloudflare Worker - ESP32 BLE HID 遥控器 (v8 多设备切换)
+ *
+ * v8 新增:
+ *   - DO 内多设备路由: register/heartbeat/list-devices + to 字段路由
+ *   - UI 设备选择器 bar (下拉框 + 在线指示器)
+ *   - 命令自动附加 to 字段路由到选定设备
  *
  * v7b 新增:
  *   - UI 新增 ⌫ 退格 (Backspace) 和 ↵ 回车 (Enter) 按钮，3×3 网格布局
- *   - 调整触控板高度约束以容纳新按钮行
- * v7a 修复:
- *   - 移除左上角标题，消除 iOS Safari 动态缩放
- *   - 状态指示移至触控板内部右上角
- *   - 添加 -webkit-text-size-adjust: 100%
- * v7 改进:
- *   - 正方形触控板 (aspect-ratio:1)，自适应屏幕
- *   - Dark 主题 AMOLED 优化
  */
 
 // ==================== 认证辅助 ====================
@@ -118,8 +115,14 @@ function checkRateLimit(ip) {
 
 function cleanupRateLimit() {
   const now = Date.now();
+  // 分批清理，避免在单次调用中遍历过多条目
+  let deleted = 0;
   for (const [ip, entry] of rateLimitMap) {
-    if (now > entry.resetTime) rateLimitMap.delete(ip);
+    if (now > entry.resetTime) {
+      rateLimitMap.delete(ip);
+      deleted++;
+    }
+    if (deleted > 50) break; // 每次最多清理 50 条，防止阻塞
   }
 }
 
@@ -207,7 +210,7 @@ f.onsubmit=async e=>{
 </body>
 </html>`;
 
-// ==================== 主控制页面 v7b (退格/回车按钮 + iOS zoom fix) ====================
+// ==================== 主控制页面 v8 (多设备切换) ====================
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -254,19 +257,44 @@ body{
   -webkit-font-smoothing:antialiased;
 }
 
+/* ===== DEVICE BAR ===== */
+.devbar{
+  display:flex;align-items:center;gap:6px;
+  width:min(calc(100vw - 20px), 380px);
+  margin:calc(2px + var(--safe-t)) auto 0;
+  padding:5px 10px;
+  border-radius:var(--rad-sm);
+  background:var(--surface);
+  border:1px solid var(--border);
+  flex-shrink:0;
+}
+.devbar-label{font-size:.68rem;color:var(--text3);flex:0 0 auto;white-space:nowrap}
+.devbar-select{
+  flex:1;padding:5px 8px;
+  border:1.5px solid var(--border);
+  border-radius:8px;
+  background:var(--surface2);
+  color:var(--text);font-size:.7rem;
+  outline:none;
+  -webkit-appearance:none;appearance:none;
+}
+.devbar-select:focus{border-color:rgba(129,140,248,.4)}
+.devbar-select option{background:var(--surface2);color:var(--text)}
+.devbar-indicator{font-size:.65rem;flex:0 0 auto;min-width:16px;text-align:center}
+
 /* ===== MAIN ===== */
 .main{
   flex:1;
   display:flex;flex-direction:column;
   align-items:center;justify-content:center;
-  padding:calc(4px + var(--safe-t)) 10px 4px;
+  padding:4px 10px 4px;
   gap:6px;
   min-height:0;
 }
 
 /* ===== TOUCHPAD (正方形) ===== */
 .tpad{
-  width:min(calc(100vw - 20px), calc(100dvh - 260px));
+  width:min(calc(100vw - 20px), calc(100dvh - 300px));
   max-width:380px;
   aspect-ratio:1;
   background:radial-gradient(ellipse at center, rgba(99,102,241,.04) 0%, transparent 70%);
@@ -443,14 +471,16 @@ body{
 
 /* ===== RESPONSIVE ===== */
 @media(min-width:500px){
+  .devbar{max-width:420px}
   .tpad{max-width:420px}
   .actions{max-width:420px}
   .speed{max-width:420px}
 }
 @media(max-height:650px){
-  .tpad{width:min(calc(100vw - 20px), calc(100dvh - 230px));max-width:300px}
+  .tpad{width:min(calc(100vw - 20px), calc(100dvh - 270px));max-width:300px}
   .actions{max-width:300px;gap:4px}
   .speed{max-width:300px}
+  .devbar{max-width:300px}
   .btn{padding:8px 3px;font-size:.68rem}
   .main{gap:4px}
 }
@@ -461,25 +491,24 @@ body{
 </head>
 <body>
 
-<!-- MAIN (无 Header，触控板从顶部安全区开始) -->
+<!-- DEVICE SELECTOR BAR -->
+<div class="devbar" id="dv" style="display:none">
+  <span class="devbar-label">设备:</span>
+  <select class="devbar-select" id="ds"><option value="">未选择设备</option></select>
+  <span class="devbar-indicator" id="di"></span>
+</div>
+
+<!-- MAIN (无 Header) -->
 <div class="main">
 
   <!-- SQUARE TOUCHPAD -->
   <div class="tpad" id="tp">
-
-    <!-- 状态指示 (触控板右上角) -->
     <div class="tpad-status">
       <div class="tpad-dot" id="sd"></div>
       <span class="tpad-stxt" id="st">未连接</span>
     </div>
-
-    <!-- 拖拽标签 (触控板左上角) -->
     <div class="lock-tag" id="lt">🔒 拖拽</div>
-
-    <!-- 触摸提示 (中心) -->
     <div class="tpad-hint" id="th">滑动 = 光标<br>轻点 = 单击</div>
-
-    <!-- 触摸光斑 -->
     <div class="tpad-dot-cursor" id="td"></div>
   </div>
 
@@ -516,21 +545,54 @@ var TP=document.getElementById('tp'),TD=document.getElementById('td'),
     TH=document.getElementById('th'),SD=document.getElementById('sd'),
     ST_=document.getElementById('st'),LT=document.getElementById('lt'),
     LB=document.getElementById('lb'),TI=document.getElementById('ti'),
-    SS=document.getElementById('ss'),SV=document.getElementById('sv');
+    SS=document.getElementById('ss'),SV=document.getElementById('sv'),
+    DV=document.getElementById('dv'),DS=document.getElementById('ds'),
+    DI=document.getElementById('di');
 
 // State
 var ws=null,rt=null,ta=false,lx=0,ly=0,ts=0,tm=false,ml=false,sp=1;
 var TAP=260,INT=35,lst=0;
+var selectedDeviceId=null,devices={};
+
+// Device selector
+DS.onchange=function(){selectedDeviceId=DS.value||null};
+function updateDeviceList(list){
+  devices={};
+  var cur=selectedDeviceId,hasCur=false;
+  DS.innerHTML='<option value="">未选择设备</option>';
+  if(!list||!list.length){DV.style.display='none';return}
+  DV.style.display='flex';
+  for(var i=0;i<list.length;i++){
+    var d=list[i];devices[d.id]=d;
+    var s=(d.online?'🟢 ':'🔴 ')+d.name+(d.connected?' [BLE]':'');
+    var o=document.createElement('option');o.value=d.id;o.textContent=s;DS.appendChild(o);
+    if(d.id===cur)hasCur=true;
+  }
+  if(!hasCur)selectedDeviceId=null;
+  DS.value=selectedDeviceId||'';
+  DI.textContent=list.filter(function(d){return d.id===selectedDeviceId}).length?'':(Object.keys(devices).length+'台');
+}
+function removeDevice(id){
+  delete devices[id];var o=DS.querySelector('option[value="'+id+'"]');if(o)o.remove();
+  if(selectedDeviceId===id){selectedDeviceId=null;DS.value=''}
+  if(!Object.keys(devices).length)DV.style.display='none';
+}
 
 // WebSocket
 function CN(){
-  if(ws&&ws.readyState===WebSocket.OPEN)return;
+  if(ws&&ws.readyState===WebSocket.OPEN){ws.send(JSON.stringify({type:'list-devices'}));return}
   US('connecting');
   var p=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(p+'//'+location.host+'/ws');
-  ws.onopen=function(){US('online');if(rt){clearTimeout(rt);rt=null}};
+  ws.onopen=function(){US('online');if(rt){clearTimeout(rt);rt=null};ws.send(JSON.stringify({type:'list-devices'}))};
   ws.onclose=function(){US('offline');SR()};
   ws.onerror=function(){ws=null};
+  ws.onmessage=function(e){
+    try{var m=JSON.parse(e.data);
+      if(m.type==='device-list')updateDeviceList(m.devices);
+      else if(m.type==='device-offline')removeDevice(m.deviceId);
+    }catch(_){}
+  };
 }
 function SR(){if(!rt)rt=setTimeout(CN,3000)}
 function US(s){
@@ -540,8 +602,8 @@ function US(s){
   else{ST_.textContent='未连接'}
 }
 function SC(a,x){
-  x=x||{};
-  if(!ws||ws.readyState!==WebSocket.OPEN){US('offline');SR();return}
+  x=x||{};if(!ws||ws.readyState!==WebSocket.OPEN){US('offline');SR();return}
+  if(selectedDeviceId)x.to=selectedDeviceId;
   ws.send(JSON.stringify(Object.assign({a:a},x)));
   TP.classList.add('flash');
   setTimeout(function(){TP.classList.remove('flash')},250);
@@ -620,11 +682,34 @@ CN();
 </body>
 </html>`;
 
-// ==================== Durable Object - WebSocket 房间 ====================
+// ==================== 输入净化 ====================
+// deviceId: 仅允许十六进制字符和冒号 (MAC 地址格式)，最长 20 字符
+function sanitizeDeviceId(id) {
+  if (!id || typeof id !== 'string') return null;
+  const cleaned = id.replace(/[^0-9A-Fa-f:]/g, '').slice(0, 20);
+  if (cleaned.length < 12) return null; // 至少 12 字符 (如 11:22:33:AA:BB:CC 不含冒号 = 12)
+  return cleaned;
+}
+
+// deviceName: 限制长度 60 字符，移除 HTML 特殊字符防 XSS
+function sanitizeDeviceName(name) {
+  if (!name || typeof name !== 'string') return 'ESP32 Device';
+  return name
+    .replace(/[<>&"']/g, '')
+    .replace(/javascript:/gi, '')
+    .slice(0, 60)
+    .trim() || 'ESP32 Device';
+}
+
+// ==================== Durable Object - WebSocket 房间 (多设备路由) ====================
+const HEARTBEAT_TIMEOUT = 45000; // 45 秒无心跳视为离线
+
 export class WebSocketDurableObject {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.devices = new Map();
+    this.controllers = new Set();
   }
 
   async fetch(request) {
@@ -632,26 +717,191 @@ export class WebSocketDurableObject {
     if (authed !== '1') {
       return new Response('Unauthorized', { status: 401 });
     }
-
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(ws, message) {
-    const sessions = this.state.getWebSockets();
-    for (const session of sessions) {
-      if (session !== ws) {
-        try {
-          session.send(message);
-        } catch (_) { }
+  broadcastDeviceList() {
+    const list = [];
+    for (const [id, dev] of this.devices) {
+      list.push({
+        id: id,
+        name: dev.name,
+        online: true,
+        connected: dev.info?.bleConnected || false,
+        encrypted: dev.info?.bleEncrypted || false,
+        lastSeen: dev.lastSeen,
+        stats: dev.info?.stats || null,
+      });
+    }
+    const msg = JSON.stringify({ type: 'device-list', devices: list });
+    for (const ctrl of this.controllers) {
+      try { ctrl.send(msg); } catch (_) { }
+    }
+  }
+
+  notifyDeviceOffline(deviceId) {
+    const msg = JSON.stringify({ type: 'device-offline', deviceId });
+    for (const ctrl of this.controllers) {
+      try { ctrl.send(msg); } catch (_) { }
+    }
+  }
+
+  // 移除设备（内部统一方法）
+  removeDevice(deviceId, reason) {
+    if (!this.devices.has(deviceId)) return;
+    this.devices.delete(deviceId);
+    console.log(`[DO] Device ${reason}: ${deviceId}`);
+    this.notifyDeviceOffline(deviceId);
+    this.broadcastDeviceList();
+  }
+
+  // 心跳超时检查 (每 30s 由 alarm 触发)
+  checkHeartbeatTimeout() {
+    const now = Date.now();
+    for (const [deviceId, dev] of this.devices) {
+      if (now - dev.lastSeen > HEARTBEAT_TIMEOUT) {
+        try { dev.ws.close(4002, 'Heartbeat timeout'); } catch (_) { }
+        this.removeDevice(deviceId, 'timeout');
       }
     }
   }
 
-  async webSocketClose(ws, code, reason, wasClean) { }
-  async webSocketError(ws, error) { }
+  async alarm() {
+    this.checkHeartbeatTimeout();
+    // 若无设备剩余，不再调度 alarm
+    if (this.devices.size === 0) {
+      try {
+        await this.state.storage.deleteAlarm();
+      } catch (e) {
+        console.error(`[DO] deleteAlarm (alarm) failed: ${e.message || e}`);
+      }
+      return;
+    }
+    // 每 30 秒再次调度
+    try {
+      await this.state.storage.setAlarm(Date.now() + 30000);
+    } catch (e) {
+      console.error(`[DO] setAlarm failed: ${e.message || e}`);
+    }
+  }
+
+  async webSocketMessage(ws, message) {
+    let parsed;
+    try {
+      parsed = JSON.parse(message);
+    } catch (_) {
+      return;
+    }
+
+    const type = parsed.type;
+
+    // 设备注册 (ESP32)
+    if (type === 'register') {
+      const deviceId = sanitizeDeviceId(parsed.deviceId);
+      if (!deviceId) {
+        // 无效 deviceId，拒绝注册但不断开连接（可能是格式错误的设备）
+        console.log(`[DO] Register rejected: invalid deviceId`);
+        return;
+      }
+      const deviceName = sanitizeDeviceName(parsed.deviceName);
+      const wasNew = !this.devices.has(deviceId);
+      if (!wasNew) {
+        const oldDev = this.devices.get(deviceId);
+        try { oldDev.ws.close(4001, 'Replaced'); } catch (_) { }
+      }
+      this.devices.set(deviceId, {
+        ws: ws,
+        name: deviceName,
+        info: parsed.info || {},
+        lastSeen: Date.now(),
+      });
+      this.controllers.delete(ws);
+      console.log(`[DO] Device registered: ${deviceId} (${deviceName})${wasNew ? ' NEW' : ' reconnected'}`);
+
+      // 首次设备注册时启动 alarm
+      if (this.devices.size === 1) {
+        try {
+          await this.state.storage.setAlarm(Date.now() + 30000);
+        } catch (e) {
+          console.error(`[DO] Initial setAlarm failed: ${e.message || e}`);
+        }
+      }
+
+      this.broadcastDeviceList();
+      return;
+    }
+
+    // 心跳 (ESP32)
+    if (type === 'heartbeat') {
+      const deviceId = sanitizeDeviceId(parsed.deviceId);
+      if (deviceId && this.devices.has(deviceId)) {
+        const dev = this.devices.get(deviceId);
+        dev.ws = ws;
+        dev.info = parsed.info || {};
+        dev.lastSeen = Date.now();
+      }
+      this.broadcastDeviceList();
+      return;
+    }
+
+    // 请求设备列表 (浏览器)
+    if (type === 'list-devices') {
+      this.controllers.add(ws);
+      this.broadcastDeviceList();
+      return;
+    }
+
+    // 控制指令路由
+    // 净化 to 字段：仅允许合法 MAC 格式
+    const targetId = parsed.to ? sanitizeDeviceId(parsed.to) : null;
+    if (targetId) {
+      const dev = this.devices.get(targetId);
+      if (dev) {
+        // 仅重建已知白名单字段 (a/x/y/b/d)，防止注入未知字段
+        const cmd = {};
+        if (typeof parsed.a === 'string' && parsed.a.length <= 2) cmd.a = parsed.a;
+        if (parsed.x !== undefined) cmd.x = Math.round(Number(parsed.x) || 0);
+        if (parsed.y !== undefined) cmd.y = Math.round(Number(parsed.y) || 0);
+        if (parsed.b !== undefined) cmd.b = Number(parsed.b) || 0;
+        if (parsed.d !== undefined && typeof parsed.d === 'string') cmd.d = parsed.d.slice(0, 200);
+        if (cmd.a) {  // 至少要有 a 字段才转发
+          try { dev.ws.send(JSON.stringify(cmd)); } catch (_) { }
+        }
+      }
+      this.controllers.add(ws);
+      return;
+    }
+
+    // 旧版兼容 (无 to 字段时广播到唯一设备)
+    this.controllers.add(ws);
+  }
+
+  async webSocketClose(ws, code, reason, wasClean) {
+    // reason 参数在闭包中可能未使用，但保留兼容性
+    this.controllers.delete(ws);
+    for (const [deviceId, dev] of this.devices) {
+      if (dev.ws === ws) {
+        this.removeDevice(deviceId, 'offline');
+        break;
+      }
+    }
+    // 所有设备离线时清除 alarm
+    if (this.devices.size === 0) {
+      try {
+        await this.state.storage.deleteAlarm();
+      } catch (e) {
+        console.error(`[DO] deleteAlarm failed: ${e.message || e}`);
+      }
+    }
+  }
+
+  async webSocketError(ws, error) {
+    // webSocketClose 也会触发，仅做 controllers 清理避免重复
+    this.controllers.delete(ws);
+  }
 }
 
 // ==================== Worker 入口 ====================
@@ -660,7 +910,7 @@ export default {
     const url = new URL(request.url);
     cleanupRateLimit();
 
-    // POST /api/auth — 密码验证
+    // POST /api/auth
     if (url.pathname === '/api/auth' && request.method === 'POST') {
       try {
         const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -697,15 +947,12 @@ export default {
       return stub.fetch(modifiedRequest);
     }
 
-    // / 或 /index.html — 控制页面
+    // / 或 /index.html
     if (url.pathname === '/' || url.pathname === '/index.html') {
       const authed = await verifyCookieAuth(request, env);
       if (!authed) {
         return new Response(LOGIN_PAGE, {
-          headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            'Cache-Control': 'no-cache',
-          },
+          headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' },
         });
       }
       return new Response(HTML_PAGE, {

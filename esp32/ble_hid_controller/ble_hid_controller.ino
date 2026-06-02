@@ -1,19 +1,19 @@
 /*
- * ESP32 BLE HID 遥控器 - C3 v18 (修复 HID 报告数据格式+坐标范围，保留 bonding 自动重连)
+ * ESP32 BLE HID 遥控器 - C3 v19 (多设备切换支持)
+ *
+ * v19 新增:
+ *   - WebSocket 连接后自动发送 register 消息 (deviceId=MAC 地址)
+ *   - 周期性发送 heartbeat 携带设备状态 (BLE 连接/加密/统计)
+ *   - 向后兼容 v18 命令格式
  *
  * v18 关键修复：
- *   - [关键] 恢复单输入报告特征 getInputReport(0) 模式：
- *     v16/v17 三特征独立 Report ID 与 BLE HOGP 规范冲突（报告首字节重复 ID → 数据错位）
- *     回到 v15 成熟方案：一个特征承载全部 Report ID (0x01/0x02/0x03)，report 数据首字节区分类型
- *   - [中等] 鼠标坐标 clamp 范围修正为 [-127, 127]，匹配报告描述符 Logical Min/Max
+ *   - 恢复单输入报告特征 getInputReport(0) 模式
+ *   - 鼠标坐标 clamp 范围修正为 [-127, 127]，匹配报告描述符 Logical Min/Max
  *
  * v17 修复（保留）：
  *   - 开启 bonding (setSecurityAuth(true, false, true)) → ESP32 重启无需重新配对
- *   - 手机锁屏唤醒后自动重连已绑定设备（手机端主动扫描已绑定设备并恢复加密）
+ *   - 手机锁屏唤醒后自动重连已绑定设备
  *   - onAuthenticationComplete 回调记录配对/加密状态
- *
- * v16 修复（保留）：
- *   - pServer->start() 在全部 getInputReport() 之后调用，确保特征注册完整
  *
  * 库依赖（Arduino IDE 内安装）：
  *   NimBLE-Arduino v2.5.0 (h2zero)
@@ -53,7 +53,7 @@ const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 
 #define AC_BACK      0x0224
 #define AC_TASK_VIEW 0x0296
 
-// 报告描述符（键盘 + 鼠标 + 消费者控制 —— 与 v15 完全一致）
+// 报告描述符（键盘 + 鼠标 + 消费者控制）
 static const uint8_t HID_REPORT_MAP[] PROGMEM = {
   0x05,0x01,0x09,0x02,0xA1,0x01,0x85,0x02,0x09,0x01,
   0xA1,0x00,0x05,0x09,0x19,0x01,0x29,0x03,0x15,0x00,
@@ -78,7 +78,7 @@ static const uint8_t HID_REPORT_MAP[] PROGMEM = {
 // ==================== 全局对象 ====================
 NimBLEServer*         pServer       = nullptr;
 NimBLEHIDDevice*      pHID          = nullptr;
-NimBLECharacteristic* pInputReport  = nullptr;   // v18: 单一输入报告特征 (Report ID 0 → 数据含 Report ID 前缀)
+NimBLECharacteristic* pInputReport  = nullptr;
 WebSocketsClient      webSocket;
 
 bool bleConnected   = false;
@@ -96,7 +96,11 @@ uint32_t g_cmdSkipped     = 0;
 
 uint32_t g_lastKeepAlive  = 0;
 
-// ==================== BLE 回调（v17: onAuthenticationComplete）====================
+// v19: 多设备支持 - 设备标识
+String g_deviceId   = "";
+String g_deviceName = "";
+
+// ==================== BLE 回调 ====================
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
     Serial.println("[BLE] Connected");
@@ -128,7 +132,6 @@ void setupBLE() {
   NimBLEDevice::init(BLE_DEVICE_NAME);
   Serial.printf("[BLE] MAC: %s\n", NimBLEDevice::getAddress().toString().c_str());
 
-  // v17: 严格参照库示例，开启 bonding
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   Serial.println("[BLE] Security: bonding=ON, MITM=OFF, SC=ON (Just Works)");
@@ -141,12 +144,10 @@ void setupBLE() {
   pHID->setHidInfo(0x00, 0x00);
   pHID->setManufacturer("ESP32-C3");
 
-  // v18: 恢复单输入报告特征，Report ID 0 → 数据首字节区分报告类型 (1/2/3)
   pInputReport = pHID->getInputReport(0);
   hidReady = (pInputReport != nullptr);
   Serial.printf("[BLE] HID ready: %d\n", hidReady);
 
-  // 所有特征创建完毕后启动服务
   pServer->start();
 
   NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
@@ -157,7 +158,7 @@ void setupBLE() {
   Serial.println("[BLE] Advertising started");
 }
 
-// ==================== HID 发送（v18: 统一通过单特征发送，首字节为 Report ID）====================
+// ==================== HID 发送 ====================
 void sendHIDReport(const uint8_t* data, size_t len) {
   if (!bleConnected || !pInputReport || !hidReady) return;
   pInputReport->setValue(data, len);
@@ -190,7 +191,7 @@ void sendConsumer(uint16_t usage) {
   uint8_t r[3] = {REPORT_ID_CONSUMER, (uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8)};
   sendHIDReport(r, 3);
   delay(40);
-  uint8_t z[3] = {REPORT_ID_CONSUMER, 0, 0};  // Usage = 0 表示释放
+  uint8_t z[3] = {REPORT_ID_CONSUMER, 0, 0};
   sendHIDReport(z, 3);
 }
 
@@ -266,29 +267,62 @@ void handleCommand(const char* json) {
     case 'd': { uint8_t k = 0x2A; sendKeyboard(0, &k, 1); delay(30); releaseKeys(); } break;
     case 'e': { uint8_t k = 0x28; sendKeyboard(0, &k, 1); delay(30); releaseKeys(); } break;
     case 'm': {
-      long dx = doc["x"] | 0L, dy = doc["y"] | 0L;
+      long dx = doc["x"].as<long>(), dy = doc["y"].as<long>();
       uint8_t btn = doc["b"].as<uint8_t>();
-      // v18: 修正 clamp 范围 [-127, 127]，匹配报告描述符 Logical Min/Max
       if (dx > 127) dx = 127; if (dx < -127) dx = -127;
       if (dy > 127) dy = 127; if (dy < -127) dy = -127;
       sendMouse(btn, (int8_t)dx, (int8_t)dy, 0);
       break;
     }
-    case 't': if (doc.containsKey("d")) typeString(doc["d"]); break;
+    case 't': {
+      const char* text = doc["d"].as<const char*>();
+      if (text) typeString(text);
+      break;
+    }
   }
 }
 
 // ==================== WebSocket ====================
+// v19: 发送设备信息消息 (注册/心跳共用)
+void sendDeviceMessage(const char* msgType) {
+  StaticJsonDocument<512> doc;
+  doc["type"]       = msgType;
+  doc["deviceId"]   = g_deviceId;
+  doc["deviceName"] = g_deviceName;
+  JsonObject info = doc.createNestedObject("info");
+  info["bleConnected"] = bleConnected;
+  info["bleEncrypted"] = bleEncrypted;
+  info["bleBonded"]    = bleBonded;
+  JsonObject stats = info.createNestedObject("stats");
+  stats["notifyOk"]   = g_notifyCount;
+  stats["notifyFail"] = g_notifyFail;
+  stats["disconn"]    = g_bleDisconnects;
+  stats["cmdCount"]   = g_cmdCount;
+  stats["cmdSkip"]    = g_cmdSkipped;
+  stats["heap"]       = ESP.getFreeHeap();
+  String out;
+  serializeJson(doc, out);
+  webSocket.sendTXT(out);
+}
+
 void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
-    case WStype_DISCONNECTED: wsConnected = false; break;
+    case WStype_DISCONNECTED:
+      wsConnected = false;
+      break;
     case WStype_CONNECTED:
       wsConnected = true;
       Serial.println("[WS] Connected");
+      sendDeviceMessage("register");  // v19: 上线即注册
       break;
-    case WStype_TEXT: handleCommand((char*)payload); break;
-    case WStype_ERROR: wsConnected = false; break;
-    default: break;
+    case WStype_TEXT:
+      handleCommand((char*)payload);
+      break;
+    case WStype_ERROR:
+      wsConnected = false;
+      break;
+    default:
+      break;
   }
 }
 
@@ -313,11 +347,20 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   Serial.println();
-  Serial.println("[SYS] ESP32 BLE HID v18 (single HID report, bonding, fixed report format)");
+  Serial.println("[SYS] ESP32 BLE HID v19 (multi-device, register+heartbeat)");
   Serial.printf("[SYS] Chip: %s, Heap: %u\n", ESP.getChipModel(), ESP.getFreeHeap());
 
   setupBLE();
   connectWiFiBlocking();
+
+  // v19: 基于 WiFi MAC 地址设置设备 ID（eFuse 硬件地址，稳定唯一）
+  // 不使用 BLE MAC，因为 NimBLE 可能使用随机静态地址，NVS 擦除后会变化
+  String wifiMac = WiFi.macAddress();
+  g_deviceId = wifiMac;
+  g_deviceName = String(BLE_DEVICE_NAME) + " (" + wifiMac + ")";
+  Serial.printf("[SYS] WiFi MAC: %s\n", wifiMac.c_str());
+  Serial.printf("[SYS] DeviceID (WiFi MAC): %s\n", g_deviceId.c_str());
+  Serial.printf("[SYS] DeviceName: %s\n", g_deviceName.c_str());
 
   webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(onWsEvent);
@@ -343,14 +386,14 @@ void loop() {
     }
   }
 
-  // Keep‑alive
+  // Keep-alive
   if (bleConnected && millis() - g_lastKeepAlive > 30000) {
     g_lastKeepAlive = millis();
     uint8_t zero[5] = {REPORT_ID_MOUSE, 0, 0, 0, 0};
     sendHIDReport(zero, 5);
   }
 
-  // 状态摘要
+  // 状态摘要 & 心跳
   static unsigned long lastStatus = 0;
   if (millis() - lastStatus > 15000) {
     lastStatus = millis();
@@ -362,6 +405,8 @@ void loop() {
       g_notifyCount, g_notifyFail, g_bleDisconnects,
       g_cmdCount, g_cmdSkipped,
       ESP.getFreeHeap());
+    // v19: 发送心跳到 DO
+    if (wsConnected) sendDeviceMessage("heartbeat");
   }
 
   // WiFi 自动重连
