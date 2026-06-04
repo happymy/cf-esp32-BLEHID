@@ -9,6 +9,7 @@ PASSWORD = "admin"
 COOKIE_SECRET = "change-me-to-a-random-string-at-least-32-chars"
 DEVICE_SECRET = "esp32-blehid-device-key-change-me"
 
+
 # 启用 WebSocket 支持 (免费计划需启用 SQLite)
 [durable_objects]
 bindings = [
