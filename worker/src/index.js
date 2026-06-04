@@ -522,7 +522,7 @@ var TP=document.getElementById('tp'),TD=document.getElementById('td'),
 
 // State
 var ws=null,rt=null,ta=false,lx=0,ly=0,ts=0,tm=false,ml=false,sp=1;
-var bleOk=false;
+var bleOk=null;
 var TAP=260,INT=35,lst=0;
 
 // WebSocket
@@ -531,8 +531,16 @@ function CN(){
   US('connecting');
   var p=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(p+'//'+location.host+'/ws');
-  ws.onopen=function(){US('online');if(rt){clearTimeout(rt);rt=null}};
-  ws.onclose=function(){bleOk=false;US('offline');SR()};
+  ws.onopen=function(){
+    if(rt){clearTimeout(rt);rt=null}
+    if(bleOk===null){
+      US('online',true);
+      ws.send('{"a":"r"}');
+    }else{
+      US('online');
+    }
+  };
+  ws.onclose=function(){US('offline');SR()};
   ws.onerror=function(){ws=null};
   ws.onmessage=function(e){
     try{

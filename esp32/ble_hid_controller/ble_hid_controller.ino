@@ -45,6 +45,7 @@ const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";   // Cloud
 const int   WS_PORT  = 443;
 const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
 
+
 // ==================== BLE HID 常量 ====================
 #define BLE_DEVICE_NAME    "ESP32 BLE Remote" //设备名可自定义
 #define REPORT_ID_KEYBOARD 1
@@ -255,6 +256,9 @@ void handleCommand(const char* json) {
     Serial.println();
   #endif
 
+  // v19: 状态请求 'r' 不受 hidReady/bleConnected 限制
+  if (a[0] == 'r') { sendBleStatus(); return; }
+
   if (!hidReady) { g_cmdSkipped++; return; }
   if (!bleConnected) { g_cmdSkipped++; return; }
 
@@ -276,6 +280,7 @@ void handleCommand(const char* json) {
       sendMouse(btn, (int8_t)dx, (int8_t)dy, 0);
       break;
     }
+    case 'r': sendBleStatus(); break;
     case 't': if (doc.containsKey("d")) typeString(doc["d"]); break;
   }
 }
