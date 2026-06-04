@@ -1,19 +1,17 @@
 /*
- * ESP32 BLE HID 遥控器 - C3 v19 (多设备切换支持)
+ * ESP32 BLE HID 遥控器 - C3 v38 (多设备切换支持)
  *
- * v19 新增:
- *   - WebSocket 连接后自动发送 register 消息 (deviceId=MAC 地址)
- *   - 周期性发送 heartbeat 携带设备状态 (BLE 连接/加密/统计)
- *   - 向后兼容 v18 命令格式
- *
- * v18 关键修复：
- *   - 恢复单输入报告特征 getInputReport(0) 模式
- *   - 鼠标坐标 clamp 范围修正为 [-127, 127]，匹配报告描述符 Logical Min/Max
- *
- * v17 修复（保留）：
- *   - 开启 bonding (setSecurityAuth(true, false, true)) → ESP32 重启无需重新配对
- *   - 手机锁屏唤醒后自动重连已绑定设备
- *   - onAuthenticationComplete 回调记录配对/加密状态
+ * ========== 版本更新日志 ==========
+ * v38 (2026-06-04): register-ack 后立即 ping 活跃窗口拉取命令；
+ *                    移除 g_cmdCount>0 条件；
+ *                    WebSocket 缓冲区 WEBSOCKETS_MAX_DATA_SIZE=4096
+ * v37: 活跃窗口高频拉取（10s / 1s / 最多 10 次 ping）
+ * v36: cmd 从 hb-ack/ping-ack 提取执行，移除独立 ws 拉取
+ * v35: 心跳间隔 15s→30s，适应 BLE keep-alive 30s
+ * v34: register-ack 后立即 ping 一次
+ * v33: 命令队列上限 MAX_CMD_QUEUE=20
+ * v32: 多设备切换支持
+ * ================================
  *
  * 库依赖（Arduino IDE 内安装）：
  *   NimBLE-Arduino v2.5.0 (h2zero)
@@ -36,6 +34,13 @@
 // ==================== 日志控制 ====================
 #define VERBOSE_CMD 1
 
+// v34: 增大 WebSocket 接收缓冲区，防止 hb-ack/ping-ack 带命令时 JSON 被截断
+// arduinoWebSockets 默认缓冲区可能不足，导致长 JSON 解析失败 → bad JSON → CMD=0
+#define WEBSOCKETS_MAX_DATA_SIZE 4096
+
+// v33: 命令队列上限（与 DO 端 MAX_QUEUE_SIZE 保持一致）
+#define MAX_CMD_QUEUE 20
+
 // ==================== 用户配置 ====================
 const char* WIFI_SSID = "你的WiFi名";
 const char* WIFI_PASS = "你的WiFi密码";
@@ -43,8 +48,9 @@ const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";   // Cloud
 const int   WS_PORT  = 443;
 const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
 
+
 // ==================== BLE HID 常量 ====================
-#define BLE_DEVICE_NAME    "ESP32 BLE Remote"
+#define BLE_DEVICE_NAME    "ESP32 BLE Remote 001" //设备名可自定义
 #define REPORT_ID_KEYBOARD 1
 #define REPORT_ID_MOUSE    2
 #define REPORT_ID_CONSUMER 3
@@ -95,16 +101,46 @@ uint32_t g_cmdCount       = 0;
 uint32_t g_cmdSkipped     = 0;
 
 uint32_t g_lastKeepAlive  = 0;
+uint32_t g_wsMsgCount     = 0;  // v21: WebSocket 消息总数
+uint32_t g_lastCmdTime     = 0;  // v21: 上次收到命令的时间
+uint32_t g_lastWsMsgTime   = 0;  // v21: 上次收到任何 WS 消息的时间
+
+// v37: 活跃窗口高频拉取 — 收到命令后 10 秒内每秒 ping 一次，延迟 <1s
+// 根因：fix1 (v36 fast drain) 有 bug：onWsEvent 中 ping-ack 0 cmd 分支重复设置
+// g_lastFastDrainPing，导致 loop() 中 timer 永远被重置 → 无限 ping 循环。
+// fix2：缩短拉取间隔到 1s，10 秒窗口，确保用户操作间隙延迟 <1s。
+uint32_t g_lastActivePing   = 0;       // 上次活跃窗口 ping 的时间
+#define ACTIVE_WINDOW_MS         10000  // 收到命令后 10 秒内保持活跃
+#define ACTIVE_PING_INTERVAL     1000   // 活跃窗口内每 1 秒 ping 一次
+#define ACTIVE_PING_MAX          10     // 最多 10 次 (覆盖 10 秒窗口)
+uint8_t  g_activePingCount    = 0;      // 活跃窗口内已 ping 次数
 
 // v19: 多设备支持 - 设备标识
 String g_deviceId   = "";
 String g_deviceName = "";
+
+// v20: register ACK 重试机制
+bool     g_registerAcked     = false;   // 是否已收到 DO 的 register-ack
+uint8_t  g_registerRetries   = 0;       // 已重试次数
+uint32_t g_lastRegisterTime  = 0;       // 上次发送 register 的时间
+#define REGISTER_RETRY_MAX      5       // 最多重试 5 次
+#define REGISTER_RETRY_INTERVAL 2000    // 2 秒无 ACK 则重试
+
+// v25: 前置声明，供 BLE 回调使用
+void sendDeviceMessage(const char* msgType);
+
+// v25: BLE 回调延迟标志 - NimBLE 回调在 FreeRTOS 任务上下文中运行，
+// 不能直接调用 WebSocket (sendTXT)，否则与主 loop() 中的 webSocket.loop()
+// 产生竞态。使用标志位延迟到 loop() 中发送。
+volatile bool g_pendingBleStatus = false;
 
 // ==================== BLE 回调 ====================
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
     Serial.println("[BLE] Connected");
     bleConnected = true;
+    // v25: 设置延迟标志，在 loop() 中安全发送
+    g_pendingBleStatus = true;
   }
 
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
@@ -113,6 +149,8 @@ class ServerCB : public NimBLEServerCallbacks {
     bleEncrypted = false;
     bleBonded    = false;
     g_bleDisconnects++;
+    // v25: 设置延迟标志，在 loop() 中安全发送
+    g_pendingBleStatus = true;
     NimBLEDevice::startAdvertising();
   }
 
@@ -122,6 +160,8 @@ class ServerCB : public NimBLEServerCallbacks {
     Serial.printf("[SEC] Encryption %s, bonded=%d\n",
       bleEncrypted ? "enabled" : "not enabled",
       bleBonded);
+    // v25: 设置延迟标志，在 loop() 中安全发送
+    g_pendingBleStatus = true;
   }
 };
 
@@ -244,6 +284,7 @@ void handleCommand(const char* json) {
   if (!a) return;
 
   g_cmdCount++;
+  g_lastCmdTime = millis();
 
   #if VERBOSE_CMD
     Serial.printf("[CMD] #%u: %s", g_cmdCount, a);
@@ -285,6 +326,7 @@ void handleCommand(const char* json) {
 // ==================== WebSocket ====================
 // v19: 发送设备信息消息 (注册/心跳共用)
 void sendDeviceMessage(const char* msgType) {
+  if (!wsConnected) return;
   StaticJsonDocument<512> doc;
   doc["type"]       = msgType;
   doc["deviceId"]   = g_deviceId;
@@ -302,24 +344,131 @@ void sendDeviceMessage(const char* msgType) {
   stats["heap"]       = ESP.getFreeHeap();
   String out;
   serializeJson(doc, out);
-  webSocket.sendTXT(out);
+  if (!webSocket.sendTXT(out)) {
+    Serial.printf("[WS] sendTXT failed for %s\n", msgType);
+  }
 }
 
 void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
       wsConnected = false;
+      g_registerAcked = false;
+      Serial.printf("[WS] Disconnected (total msgs received=%u)\n", g_wsMsgCount);
       break;
     case WStype_CONNECTED:
       wsConnected = true;
+      g_registerAcked = false;
+      g_registerRetries = 0;
+      g_wsMsgCount = 0;          // 新连接重置消息计数
+      g_lastWsMsgTime = millis();
       Serial.println("[WS] Connected");
-      sendDeviceMessage("register");  // v19: 上线即注册
+      sendDeviceMessage("register");
+      g_lastRegisterTime = millis();
       break;
-    case WStype_TEXT:
-      handleCommand((char*)payload);
+    case WStype_TEXT: {
+      g_wsMsgCount++;
+      g_lastWsMsgTime = millis();
+
+      // v21: 对非 JSON 消息记录前缀，帮助诊断
+      #if VERBOSE_CMD
+        char preview[33];
+        size_t pl = length < 32 ? length : 32;
+        memcpy(preview, payload, pl);
+        preview[pl] = '\0';
+        // 清理换行符
+        for (size_t i = 0; i < pl; i++) if (preview[i] < 32 && preview[i] > 0) preview[i] = '.';
+      #endif
+
+      // v20/v21/v32: 解析系统消息（register-ack, ping, hb-ack, ping-ack）
+      // v32: StaticJsonDocument<512> 确保容纳包含命令数组的 hb-ack/ping-ack
+      StaticJsonDocument<512> docAck;
+      if (!deserializeJson(docAck, (char*)payload)) {
+        const char* msgType = docAck["type"];
+
+        // register-ack (v32: 也提取 cmds 数组)
+        if (msgType && strcmp(msgType, "register-ack") == 0) {
+          const char* ackDev = docAck["deviceId"];
+          if (ackDev && String(ackDev) == g_deviceId) {
+            g_registerAcked = true;
+            g_registerRetries = 0;
+            Serial.printf("[WS] Register ACK received for %s\n", g_deviceId.c_str());
+            // v32: 提取嵌入的命令队列（替换旧版独立 ws.send 排空）
+            JsonArray regcmds = docAck["cmds"].as<JsonArray>();
+            if (regcmds.size() > 0) {
+              Serial.printf("[WS] register-ack: %u cmd(s) received\n", (unsigned)regcmds.size());
+              for (JsonObject cmdObj : regcmds) {
+                String cmdStr;
+                serializeJson(cmdObj, cmdStr);
+                handleCommand((char*)cmdStr.c_str());
+              }
+            }
+            // v38: 注册确认后立即发 ping 拉取 DO 中可能残留的待处理命令
+            // 根因：如果 regcmds 为空（或排空了 MAX_DRAIN_SIZE 条但还有剩余），
+            // ESP32 不会主动 ping → 剩余命令等到 15s heartbeat 才被拉取 → 高延迟
+            g_lastCmdTime = millis();
+            g_activePingCount = 0;
+            g_lastActivePing = millis();
+            Serial.println("[WS] Register ACK: sending ping to drain any pending commands");
+            webSocket.sendTXT("{\"type\":\"ping\",\"deviceId\":\"" + g_deviceId + "\"}");
+            g_lastWsMsgTime = millis();
+            break;
+          }
+        }
+
+        // v21: ping-pong 协议 — DO 可在休眠时发送 ping 测试连通性
+        if (msgType && strcmp(msgType, "ping") == 0) {
+          String pong = "{\"type\":\"pong\",\"deviceId\":\"" + g_deviceId + "\"}";
+          webSocket.sendTXT(pong);
+          #if VERBOSE_CMD
+            Serial.println("[WS] Ping received, pong sent");
+          #endif
+          break;
+        }
+
+        // v37: hb-ack / ping-ack — DO 将命令队列嵌入回复，ESP32 从 cmds 数组提取执行
+        if (msgType && (strcmp(msgType, "hb-ack") == 0 || strcmp(msgType, "ping-ack") == 0)) {
+          JsonArray cmds = docAck["cmds"].as<JsonArray>();
+          unsigned int cmdCount = cmds.size();
+          if (cmdCount > 0) {
+            Serial.printf("[WS] %s: %u cmd(s) received\n", msgType, cmdCount);
+            for (JsonObject cmdObj : cmds) {
+              String cmdStr;
+              serializeJson(cmdObj, cmdStr);
+              handleCommand((char*)cmdStr.c_str());
+            }
+            // 收到命令 → 启动/重置活跃窗口 + 立即发 ping 排空下一批
+            g_activePingCount = 0;
+            g_lastActivePing = millis();
+            Serial.printf("[WS] Received %u cmd(s), sending ping for next batch\n", cmdCount);
+            webSocket.sendTXT("{\"type\":\"ping\",\"deviceId\":\"" + g_deviceId + "\"}");
+            g_lastWsMsgTime = millis();
+          } else {
+            // ping-ack 返回 0 条 — 不做任何事，由 loop() 中的活跃窗口 timer 负责重试
+            #if VERBOSE_CMD
+              Serial.printf("[WS] %s: 0 cmd(s)\n", msgType);
+            #endif
+          }
+          break;  // 不 fall through 到 handleCommand
+        }
+
+        // v21: DO 可能因队列排空发送多条命令，记录非命令消息
+        if (msgType) {
+          Serial.printf("[WS] Msg #%u: type=%s\n", g_wsMsgCount, msgType);
+        }
+        // 不是已知系统消息 → 作为直接命令解析 (浏览器 UI 发来的 {"a":"c"} 等)
+        handleCommand((char*)payload);
+      } else {
+        // v34: JSON 解析失败 → 不 fall through 到 handleCommand
+        // 截断/损坏的消息无法解析为命令，直接跳过
+        Serial.printf("[WS] Msg #%u: bad JSON, raw=\"%s\"\n", g_wsMsgCount, preview);
+      }
       break;
+    }
     case WStype_ERROR:
       wsConnected = false;
+      g_registerAcked = false;
+      Serial.printf("[WS] Error (total msgs received=%u)\n", g_wsMsgCount);
       break;
     default:
       break;
@@ -347,7 +496,7 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   Serial.println();
-  Serial.println("[SYS] ESP32 BLE HID v19 (multi-device, register+heartbeat)");
+  Serial.println("[SYS] ESP32 BLE HID v38 (multi-device, register+heartbeat)");
   Serial.printf("[SYS] Chip: %s, Heap: %u\n", ESP.getChipModel(), ESP.getFreeHeap());
 
   setupBLE();
@@ -386,6 +535,12 @@ void loop() {
     }
   }
 
+  // v25: 处理 BLE 回调延迟的状态更新（线程安全）
+  if (g_pendingBleStatus) {
+    g_pendingBleStatus = false;
+    sendDeviceMessage("status");
+  }
+
   // Keep-alive
   if (bleConnected && millis() - g_lastKeepAlive > 30000) {
     g_lastKeepAlive = millis();
@@ -393,20 +548,69 @@ void loop() {
     sendHIDReport(zero, 5);
   }
 
+  // v37: 活跃窗口高频拉取 — 距离上次收到命令 10 秒内，每 1 秒 ping 一次
+  // 确保用户短暂停止后恢复操作时，延迟 <1s（vs 原来等 15s heartbeat）
+  unsigned long sinceCmd = (millis() - g_lastCmdTime);
+  // v38: 移除 g_cmdCount > 0 条件
+  // 根因：register-ack 设置 g_lastCmdTime 后，如果之前从未收到命令 (g_cmdCount=0)，
+  // g_cmdCount > 0 阻止活跃窗口启动 → 剩余命令等到 15s heartbeat → 高延迟
+  if (wsConnected && g_registerAcked && sinceCmd < ACTIVE_WINDOW_MS && g_activePingCount < ACTIVE_PING_MAX) {
+    if (millis() - g_lastActivePing > ACTIVE_PING_INTERVAL) {
+      g_activePingCount++;
+      g_lastActivePing = millis();
+      Serial.printf("[WS] Active ping #%d/%d (last cmd %lu ms ago)\n", g_activePingCount, ACTIVE_PING_MAX, sinceCmd);
+      webSocket.sendTXT("{\"type\":\"ping\",\"deviceId\":\"" + g_deviceId + "\"}");
+      g_lastWsMsgTime = millis();
+    }
+  }
+
+  // v21: idle ping — WS 已连接但超过 30 秒未收到任何消息，发送 ping 唤醒 DO
+  // DO hibernation 后 ws 绑定丢失，ping 触发 webSocketMessage 重新绑定 ws
+  if (wsConnected && g_registerAcked && g_activePingCount >= ACTIVE_PING_MAX && millis() - g_lastWsMsgTime > 30000) {
+    Serial.printf("[WS] Idle %lu sec: sending ping to re-establish DO ws binding\n",
+      (unsigned long)((millis() - g_lastWsMsgTime) / 1000));
+    String ping = "{\"type\":\"ping\",\"deviceId\":\"" + g_deviceId + "\"}";
+    webSocket.sendTXT(ping);
+    g_lastWsMsgTime = millis();  // 防止 ping 风暴
+  }
+
   // 状态摘要 & 心跳
   static unsigned long lastStatus = 0;
   if (millis() - lastStatus > 15000) {
     lastStatus = millis();
-    Serial.printf("[STAT] BLE=%d ENC=%d BOND=%d WS=%d Ok=%u Fail=%u Disc=%u Cmd=%u Skip=%u Heap=%u\n",
+    // v21: 检测命令饥饿 — WS 已连接但长时间无命令
+    unsigned long secSinceCmd = (millis() - g_lastCmdTime) / 1000;
+    bool cmdStarving = wsConnected && (g_cmdCount > 0) && (secSinceCmd > 30);
+
+    Serial.printf("[STAT] BLE=%d ENC=%d BOND=%d WS=%d Ok=%u Fail=%u Disc=%u Cmd=%u Skip=%u Heap=%u%s\n",
       bleConnected,
       bleEncrypted,
       bleBonded,
       wsConnected,
       g_notifyCount, g_notifyFail, g_bleDisconnects,
       g_cmdCount, g_cmdSkipped,
-      ESP.getFreeHeap());
+      ESP.getFreeHeap(),
+      cmdStarving ? " [WARN: cmd starving!]" : "");
+
+    if (cmdStarving) {
+      Serial.printf("[WARN] WS connected %u sec ago, last cmd %lu sec ago, msgs received=%u. "
+                     "DO hibernation may have broken ws binding.\n",
+        (unsigned long)((millis() - (g_lastWsMsgTime > 0 ? g_lastWsMsgTime : millis())) / 1000),
+        secSinceCmd, g_wsMsgCount);
+    }
+
     // v19: 发送心跳到 DO
     if (wsConnected) sendDeviceMessage("heartbeat");
+  }
+
+  // v20: register ACK 重试 (最多 REGISTER_RETRY_MAX 次)
+  if (wsConnected && !g_registerAcked && g_registerRetries < REGISTER_RETRY_MAX) {
+    if (millis() - g_lastRegisterTime > REGISTER_RETRY_INTERVAL) {
+      g_registerRetries++;
+      g_lastRegisterTime = millis();
+      Serial.printf("[WS] Register retry #%d/%d\n", g_registerRetries, REGISTER_RETRY_MAX);
+      sendDeviceMessage("register");
+    }
   }
 
   // WiFi 自动重连
