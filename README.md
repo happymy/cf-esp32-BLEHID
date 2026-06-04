@@ -158,7 +158,7 @@ Web 页面与 ESP32 之间通过 JSON 通信，Worker Durable Object 中继转�
 | 拖拽移动 | `{"a":"m","x":dx,"y":dy,"b":1}` | 锁定模式下左键保持按下 |
 | 输入文字 | `{"a":"t","d":"hello"}` | 模拟键盘逐字符输入 (支持 ASCII) |
 
-## BLE 连接管理 (v18)
+## BLE 连接管理
 
 | 机制 | 说明 |
 |------|------|
@@ -171,12 +171,13 @@ Web 页面与 ESP32 之间通过 JSON 通信，Worker Durable Object 中继转�
 | **坐标范围对齐** | 鼠标位移 clamp `[-127, 127]`，严格匹配报告描述符 `Logical Minimum = -127, Maximum = 127` |
 | **Keep‑alive** | 每 30 秒发送空鼠标报告，维持 BLE 连接活跃 |
 
-> **关键修复**：v16/v17 的三特征独立 Report ID 与 BLE HOGP 协议冲突——Report Reference 描述符已声明 Report ID，但数据又包含 ID 字节，导致手机端 HID 解析偏移一位，所有按键/移动均错乱。v18 回归单特征 `getInputReport(0)` 的成熟方案，从根源消除数据错位。
+> **关键修复说明**：早期版本的三特征独立 Report ID 与 BLE HOGP 协议存在兼容性问题——当 Report Reference 描述符已声明 Report ID，但数据又包含 ID 字节时，会导致手机端 HID 解析出现偏移，所有按键/移动均错乱。当前版本采用单特征 `getInputReport(0)` 的成熟方案，从根本上消除了数据错位问题。
 
 ## 版本历史
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v19 (ESP32) | 2026-06 | 增加蓝牙状态上报|
 | v18 (ESP32) | 2026-05 | 修复 HOGP 报告格式 Bug（三特征→单特征 getInputReport(0)，消除数据一字节错位）；鼠标坐标 clamp 修正为 [-127,127] |
 | v17 (ESP32) | 2026-05 | 开启 bonding 实现自动重连：重启无需重新配对，锁屏后自动恢复；GATT 三特征分离修复 |
 | v16 (ESP32) | 2026-05 | 彻底重写：关闭 bonding，照抄官方示例回调，移除所有自定义 BLE 恢复逻辑 |

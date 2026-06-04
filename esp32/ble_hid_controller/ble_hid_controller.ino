@@ -1,6 +1,8 @@
 /*
- * ESP32 BLE HID 遥控器 - C3 v18 (修复 HID 报告数据格式+坐标范围，保留 bonding 自动重连)
+ * ESP32 BLE HID 遥控器 - C3 v19 (蓝牙状态上报)
  *
+ * v19 新增：
+ *   - 蓝牙状态上报
  * v18 关键修复：
  *   - [关键] 恢复单输入报告特征 getInputReport(0) 模式：
  *     v16/v17 三特征独立 Report ID 与 BLE HOGP 规范冲突（报告首字节重复 ID → 数据错位）
@@ -20,7 +22,7 @@
  *   ArduinoJson v7.x (Benoit Blanchon)
  *   arduinoWebSockets (Markus Sattler)
  *
- * 开发板：MakerGO ESP32-C3-SUPER-MINI, Partition Scheme = Huge APP
+ * 开发板：MakerGO ESP32-C3-SUPER-MINI,按需开启 USB CDC On Boot,Partition Scheme = Huge APP
  */
 
 #include <NimBLEDevice.h>
@@ -44,7 +46,7 @@ const int   WS_PORT  = 443;
 const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
 
 // ==================== BLE HID 常量 ====================
-#define BLE_DEVICE_NAME    "ESP32 BLE Remote"
+#define BLE_DEVICE_NAME    "ESP32 BLE Remote" //设备名可自定义
 #define REPORT_ID_KEYBOARD 1
 #define REPORT_ID_MOUSE    2
 #define REPORT_ID_CONSUMER 3
@@ -279,12 +281,23 @@ void handleCommand(const char* json) {
 }
 
 // ==================== WebSocket ====================
+void sendBleStatus() {
+  if (!wsConnected) return;
+  StaticJsonDocument<64> doc;
+  doc["a"] = "status";
+  doc["ble"] = bleConnected;
+  String out;
+  serializeJson(doc, out);
+  webSocket.sendTXT(out);
+}
+
 void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED: wsConnected = false; break;
     case WStype_CONNECTED:
       wsConnected = true;
       Serial.println("[WS] Connected");
+      sendBleStatus();
       break;
     case WStype_TEXT: handleCommand((char*)payload); break;
     case WStype_ERROR: wsConnected = false; break;
@@ -313,7 +326,7 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   Serial.println();
-  Serial.println("[SYS] ESP32 BLE HID v18 (single HID report, bonding, fixed report format)");
+  Serial.println("[SYS] ESP32 BLE HID v19 - Bluetooth Status Reporting");
   Serial.printf("[SYS] Chip: %s, Heap: %u\n", ESP.getChipModel(), ESP.getFreeHeap());
 
   setupBLE();
@@ -350,7 +363,20 @@ void loop() {
     sendHIDReport(zero, 5);
   }
 
-  // 状态摘要
+  // 状态摘要 + 蓝牙状态上报
+  static bool lastBleState = false;
+  if (bleConnected != lastBleState) {
+    lastBleState = bleConnected;
+    if (wsConnected) {
+      StaticJsonDocument<64> doc;
+      doc["a"] = "status";
+      doc["ble"] = bleConnected;
+      String out;
+      serializeJson(doc, out);
+      webSocket.sendTXT(out);
+      Serial.printf("[STAT] Sent BLE status: %d\n", bleConnected);
+    }
+  }
   static unsigned long lastStatus = 0;
   if (millis() - lastStatus > 15000) {
     lastStatus = millis();

@@ -1,6 +1,8 @@
 /**
- * Cloudflare Worker - ESP32 BLE HID 遥控器 (v7b + 退格/回车按钮)
+ * Cloudflare Worker - ESP32 BLE HID 遥控器 (v7c + 蓝牙状态上报)
  *
+ * v7c 新增:
+ *   - 蓝牙状态（连接/断开/连接中），触控板右上角显示状态指示灯和文字
  * v7b 新增:
  *   - UI 新增 ⌫ 退格 (Backspace) 和 ↵ 回车 (Enter) 按钮，3×3 网格布局
  *   - 调整触控板高度约束以容纳新按钮行
@@ -470,7 +472,7 @@ body{
     <!-- 状态指示 (触控板右上角) -->
     <div class="tpad-status">
       <div class="tpad-dot" id="sd"></div>
-      <span class="tpad-stxt" id="st">未连接</span>
+      <span class="tpad-stxt" id="st">ESP32：未连接</span>
     </div>
 
     <!-- 拖拽标签 (触控板左上角) -->
@@ -520,6 +522,7 @@ var TP=document.getElementById('tp'),TD=document.getElementById('td'),
 
 // State
 var ws=null,rt=null,ta=false,lx=0,ly=0,ts=0,tm=false,ml=false,sp=1;
+var bleOk=false;
 var TAP=260,INT=35,lst=0;
 
 // WebSocket
@@ -529,15 +532,34 @@ function CN(){
   var p=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(p+'//'+location.host+'/ws');
   ws.onopen=function(){US('online');if(rt){clearTimeout(rt);rt=null}};
-  ws.onclose=function(){US('offline');SR()};
+  ws.onclose=function(){bleOk=false;US('offline');SR()};
   ws.onerror=function(){ws=null};
+  ws.onmessage=function(e){
+    try{
+      var m=JSON.parse(e.data);
+      if(m.a==='status'){
+        bleOk=!!m.ble;
+        US(ws&&ws.readyState===WebSocket.OPEN?'online':'offline');
+      }
+    }catch(_){}
+  };
 }
 function SR(){if(!rt)rt=setTimeout(CN,3000)}
 function US(s){
   SD.className='tpad-dot';
-  if(s==='online'){SD.classList.add('on');ST_.textContent='已连接'}
-  else if(s==='connecting'){SD.classList.add('connecting');ST_.textContent='连接中'}
-  else{ST_.textContent='未连接'}
+  if(s==='online'){
+    if(bleOk){
+      SD.classList.add('on');
+      ST_.textContent='ESP32：已连接，蓝牙已连接';
+    }else{
+      SD.classList.add('connecting');
+      ST_.textContent='ESP32：已连接，蓝牙断开';
+    }
+  }else if(s==='connecting'){
+    SD.classList.add('connecting');ST_.textContent='ESP32：连接中';
+  }else{
+    ST_.textContent='ESP32：未连接';
+  }
 }
 function SC(a,x){
   x=x||{};
