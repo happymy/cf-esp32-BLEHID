@@ -84,7 +84,7 @@ npm run deploy
    ```cpp
    const char* WIFI_SSID = "你的WiFi名";
    const char* WIFI_PASS = "你的WiFi密码";
-   const char* WS_HOST  = "hid.siyan.dpdns.org";
+   const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";
    const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
    ```
 
