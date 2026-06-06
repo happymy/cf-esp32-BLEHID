@@ -1,7 +1,10 @@
 /*
- * ESP32 BLE HID 遥控器 - C3 v38 (多设备切换支持)
+ * ESP32 BLE HID 遥控器 - C3 v39 (LED 状态指示)
  *
  * ========== 版本更新日志 ==========
+ * v39 (2026-06-06): 板载蓝色 LED 状态指示 — WiFi/WS/BLE 连接状态
+ *                    快闪(200ms)=WiFi断开; 慢闪(1000ms)=服务器断开;
+ *                    双闪=BLE断开; 常亮=全部正常
  * v38 (2026-06-04): register-ack 后立即 ping 活跃窗口拉取命令；
  *                    移除 g_cmdCount>0 条件；
  *                    WebSocket 缓冲区 WEBSOCKETS_MAX_DATA_SIZE=4096
@@ -577,7 +580,7 @@ void setup() {
   digitalWrite(LED_BUILTIN, HIGH); // 初始灭
 
   Serial.println();
-  Serial.println("[SYS] ESP32 BLE HID v38 (multi-device, register+heartbeat)");
+  Serial.println("[SYS] ESP32 BLE HID v39（板载 LED 状态指示）");
   Serial.printf("[SYS] Chip: %s, Heap: %u\n", ESP.getChipModel(), ESP.getFreeHeap());
 
   setupBLE();

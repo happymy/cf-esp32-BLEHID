@@ -9,7 +9,7 @@
     ↕ WebSocket (Cookie 认证)
 Cloudflare Worker v38 (Durable Object 多设备路由中继 · 命令入队持久化 · hb-ack/ping-ack 嵌入排空)
     ↕ WebSocket (设备令牌认证 ?token=xxx)
-ESP32-C3 #1 ~ #N (WiFi + BLE HID v38)
+ESP32-C3 #1 ~ #N (WiFi + BLE HID v39 · 板载 LED 状态指示)
     ↕ BLE HID
 手机 / 平板 #1 ~ #N (被控端)
 ```
@@ -31,11 +31,13 @@ worker/
 ├── package.json          # Node 依赖 (wrangler)
 ├── wrangler.toml         # Cloudflare Worker 配置 + 环境变量
 └── src/
-    └── index.js          # Worker v38 (登录页 + 控制页 + DO 多设备路由)
+    ├── index.js          # Worker v38 (登录页 + 控制页 + DO 多设备路由)
+    └── hid.html          # 控制页面 HTML 模板
 
 esp32/
-└── ble_hid_controller/
-    └── ble_hid_controller.ino   # ESP32-C3 v38 接收端 (register + heartbeat + active-window)
+├── ble_hid_controller/
+│   └── ble_hid_controller.ino   # ESP32-C3 v39 (LED 状态指示 + register + heartbeat + active-window)
+└── lib/                         # 依赖库 (见 .gitignore)
 ```
 
 ## 快速开始
@@ -82,10 +84,11 @@ npm run deploy
 3. **修改 `esp32/ble_hid_controller/ble_hid_controller.ino` 中的配置**:
 
    ```cpp
-   const char* WIFI_SSID = "你的WiFi名";
-   const char* WIFI_PASS = "你的WiFi密码";
-   const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";
-   const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
+    const char* WIFI_SSID = "你的WiFi名";
+    const char* WIFI_PASS = "你的WiFi密码";
+    const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";
+    const int   WS_PORT  = 443;
+    const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
    ```
 
 4. **修改蓝牙设备名（可选）**：
@@ -100,7 +103,7 @@ npm run deploy
 
 ````
 
-ESP32 BLE HID v38 (multi-device, register+heartbeat+active-window)
+ESP32 BLE HID v39（板载 LED 状态指示）
 [SYS] DeviceID: xx:xx:xx:xx:xx:xx
 [SYS] DeviceName: ESP32 BLE Remote (xx:xx:xx:xx:xx:xx)
 [BLE] MAC: ...
@@ -110,6 +113,14 @@ ESP32 BLE HID v38 (multi-device, register+heartbeat+active-window)
 [WiFi] Connected, IP: x.x.x.x
 [WS] Connected
 [STAT] BLE=1 ENC=1 BOND=1 WS=1 Ok=… Fail=… Disc=… Cmd=… Skip=… Heap=…
+
+板载蓝色 LED 状态指示：
+| LED 状态 | 含义 |
+|----------|------|
+| 常亮 | 全部连接正常 |
+| 双闪 (两短亮+长灭) | BLE 未连接 |
+| 慢闪 (1000ms 周期) | WebSocket (服务器) 未连接 |
+| 快闪 (200ms 周期) | WiFi 未连接 |
 
 ```
 
@@ -132,7 +143,7 @@ https://cf-esp32-blehid.你的用户名.workers.dev
 1. 输入登录密码（在 Cloudflare 环境变量中设置）。
 2. 登录成功后进入控制页面，顶部显示**设备选择器**，选择目标设备后触控板右上角状态指示**已连接**即可操控。
 
-## 多设备支持 (v38)
+## 多设备支持
 
 每个 ESP32 上线时通过 `register` 消息向 Worker 注册（deviceId = MAC 地址），并每 30 秒发送 `heartbeat` 维持在线状态。
 
@@ -211,6 +222,7 @@ Web 页面与 ESP32 之间通过 JSON 通信，Worker Durable Object 中继转�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v39 (ESP32) | 2026-06 | 板载蓝色 LED 状态指示（快闪=WiFi断开，慢闪=服务器断开，双闪=BLE断开，常亮=全部正常） |
 | v38 (Worker) | 2026-06 | MAX_DRAIN_SIZE=3 心跳排空限流；修复定义顺序导致 ReferenceError |
 | v37 (Worker) | 2026-06 | 活跃窗口高频拉取（10s 窗口 / 1s 间隔 / 最多 6 次 ping） |
 | v36 (Worker) | 2026-06 | alarm 触发 drainCommands 排空待发命令 |
@@ -285,6 +297,8 @@ A: 每台 ESP32 使用相同的 `DEVICE_SECRET` 令牌烧录固件，各自 MAC 
 - **支持多 ESP32 同时在线**——Durable Object 通过 `to` 字段精准路由指令到指定设备，设备选择器下拉切换。
 - ESP32 需保持供电，WiFi 断开会自动重连（30s 检测间隔）。
 - BLE 连接通过 bonding + Keep‑alive（30s 空报告）维持，重启或锁屏后自动恢复，无需重新配对。
+- **板载蓝色 LED（GPIO 8，反相逻辑）**直观指示连接状态：常亮=全部正常，双闪=BLE未连，慢闪=服务器未连，快闪=WiFi未连。启动初始化期间 LED 熄灭。
+- 注意 GPIO 8 同时也是 strapping pin，启动期间不要拉低，否则影响正常启动。
 - 若手机端操作无响应，检查数据是否因 HOGP 报告格式不一致而错位——v18 已通过单特征 getInputReport(0) 从根源解决。
 - 若手机端出现异常（如无法连接），可在蓝牙设置中"忽略此设备"后重新配对，NVS 中的旧绑定信息将被覆盖。
 - 触摸板支持手机触摸事件和桌面端鼠标拖拽。
