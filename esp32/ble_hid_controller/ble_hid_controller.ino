@@ -42,12 +42,30 @@
 #define MAX_CMD_QUEUE 20
 
 // ==================== 用户配置 ====================
+//const char* WIFI_SSID = "你的WiFi名";
+//const char* WIFI_PASS = "你的WiFi密码";
+//const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";   // Cloudflare Worker 域名
+//const int   WS_PORT  = 443;
+//const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
+
 const char* WIFI_SSID = "你的WiFi名";
 const char* WIFI_PASS = "你的WiFi密码";
 const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";   // Cloudflare Worker 域名
 const int   WS_PORT  = 443;
 const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
 
+// ==================== LED 状态指示 ====================
+// GPIO 8 板载蓝色 LED，反相逻辑 (LOW=亮 HIGH=灭)
+#define LED_BUILTIN 8
+
+// LED 模式（优先级从高到低）
+enum {
+  LED_SOLID_ON,     // 全部正常 → 常亮
+  LED_DOUBLE_BLINK, // BLE 未连接 → 双闪
+  LED_SLOW_BLINK,   // 服务器未连接 → 慢闪
+  LED_FAST_BLINK,   // WiFi 未连接 → 快闪
+  LED_COUNT
+};
 
 // ==================== BLE HID 常量 ====================
 #define BLE_DEVICE_NAME    "ESP32 BLE Remote 001" //设备名可自定义
@@ -128,6 +146,11 @@ uint32_t g_lastRegisterTime  = 0;       // 上次发送 register 的时间
 
 // v25: 前置声明，供 BLE 回调使用
 void sendDeviceMessage(const char* msgType);
+
+// LED 状态变量
+uint8_t  g_ledMode      = LED_FAST_BLINK;
+uint8_t  g_ledBlinkStep = 0;
+uint32_t g_ledLastToggle = 0;
 
 // v25: BLE 回调延迟标志 - NimBLE 回调在 FreeRTOS 任务上下文中运行，
 // 不能直接调用 WebSocket (sendTXT)，否则与主 loop() 中的 webSocket.loop()
@@ -491,10 +514,68 @@ void connectWiFiBlocking() {
   }
 }
 
+// ==================== LED 状态更新 ====================
+void updateLED() {
+  unsigned long now = millis();
+
+  // 确定当前应有的 LED 模式（优先级：WiFi > WS > BLE > 全正常）
+  uint8_t desired;
+  if (WiFi.status() != WL_CONNECTED) {
+    desired = LED_FAST_BLINK;
+  } else if (!wsConnected) {
+    desired = LED_SLOW_BLINK;
+  } else if (!bleConnected) {
+    desired = LED_DOUBLE_BLINK;
+  } else {
+    desired = LED_SOLID_ON;
+  }
+
+  // 模式切换时重置状态机
+  if (desired != g_ledMode) {
+    g_ledMode = desired;
+    g_ledBlinkStep = 0;
+    g_ledLastToggle = now;
+  }
+
+  switch (g_ledMode) {
+    case LED_SOLID_ON:
+      digitalWrite(LED_BUILTIN, LOW); // 常亮
+      break;
+
+    case LED_FAST_BLINK: // 快闪 200ms 周期
+      if (now - g_ledLastToggle >= 100) {
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+        g_ledLastToggle = now;
+      }
+      break;
+
+    case LED_SLOW_BLINK: // 慢闪 1000ms 周期
+      if (now - g_ledLastToggle >= 500) {
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+        g_ledLastToggle = now;
+      }
+      break;
+
+    case LED_DOUBLE_BLINK: { // 双闪 (100亮+100灭+100亮+1700灭)
+      static const uint16_t durations[] = {100, 100, 100, 1700};
+      if (now - g_ledLastToggle >= durations[g_ledBlinkStep]) {
+        g_ledBlinkStep = (g_ledBlinkStep + 1) % 4;
+        digitalWrite(LED_BUILTIN, (g_ledBlinkStep % 2) ? HIGH : LOW);
+        g_ledLastToggle = now;
+      }
+      break;
+    }
+  }
+}
+
 // ==================== setup ====================
 void setup() {
   Serial.begin(115200);
   delay(2000);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // 初始灭
+
   Serial.println();
   Serial.println("[SYS] ESP32 BLE HID v38 (multi-device, register+heartbeat)");
   Serial.printf("[SYS] Chip: %s, Heap: %u\n", ESP.getChipModel(), ESP.getFreeHeap());
@@ -523,6 +604,8 @@ void setup() {
 // ==================== loop ====================
 void loop() {
   webSocket.loop();
+
+  updateLED();
 
   // 内存监控
   static unsigned long lastHeapCheck = 0;
