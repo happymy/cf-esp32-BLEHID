@@ -15,6 +15,8 @@
  * ================================
  */
 
+import { DurableObject } from 'cloudflare:workers';
+
 // ==================== 认证辅助 ====================
 
 async function passwordFingerprint(password) {
@@ -740,10 +742,9 @@ const HEARTBEAT_TIMEOUT = 90000; // 90 秒无心跳视为离线 (v21: 45→90，
 const STORAGE_KEY_DEVICES = 'persisted_devices'; // v21: DO 状态持久化键
 const ALARM_INTERVAL = 30000;       // alarm 间隔 30s
 
-export class WebSocketDurableObject {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
+export class WebSocketDurableObject extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
     this.devices = new Map();        // deviceId → { ws, name, info, lastSeen }
     this.controllers = new Set();    // 浏览器 ws 集合
     this.storageLoaded = false;      // v21: 持久化数据是否已加载
@@ -754,7 +755,7 @@ export class WebSocketDurableObject {
   async loadDevicesFromStorage() {
     if (this.storageLoaded) return;
     try {
-      const raw = await this.state.storage.get(STORAGE_KEY_DEVICES);
+      const raw = await this.ctx.storage.get(STORAGE_KEY_DEVICES);
       if (raw && typeof raw === 'object') {
         for (const [deviceId, meta] of Object.entries(raw)) {
           this.devices.set(deviceId, {
@@ -767,7 +768,7 @@ export class WebSocketDurableObject {
         console.log(`[DO] Restored ${this.devices.size} device(s) from storage`);
       }
       // v31: 恢复待排空命令队列（hibernation 后持久化恢复）
-      const rawCmds = await this.state.storage.get('pending_cmds');
+      const rawCmds = await this.ctx.storage.get('pending_cmds');
       if (rawCmds && typeof rawCmds === 'object') {
         for (const [deviceId, queue] of Object.entries(rawCmds)) {
           if (Array.isArray(queue) && queue.length > 0) {
@@ -790,7 +791,7 @@ export class WebSocketDurableObject {
       if (queue.length > 0) data[deviceId] = queue;
     }
     try {
-      await this.state.storage.put('pending_cmds', data);
+      await this.ctx.storage.put('pending_cmds', data);
     } catch (e) {
       console.error(`[DO] persistPendingCommands failed: ${e.message || e}`);
     }
@@ -807,20 +808,23 @@ export class WebSocketDurableObject {
       };
     }
     try {
-      await this.state.storage.put(STORAGE_KEY_DEVICES, data);
+      await this.ctx.storage.put(STORAGE_KEY_DEVICES, data);
     } catch (e) {
       console.error(`[DO] persistDevices failed: ${e.message || e}`);
     }
   }
 
   async fetch(request) {
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return new Response('Expected WebSocket', { status: 426 });
+    }
     const authed = request.headers.get('X-Authed');
     if (authed !== '1') {
       return new Response('Unauthorized', { status: 401 });
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    this.state.acceptWebSocket(server);
+    this.ctx.acceptWebSocket(server);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -853,8 +857,6 @@ export class WebSocketDurableObject {
   // 移除设备（内部统一方法）
   async removeDevice(deviceId, reason) {
     if (!this.devices.has(deviceId)) return;
-    const dev = this.devices.get(deviceId);
-    // 不 close ws：当 ws 断开时 webSocketClose 会处理
     this.devices.delete(deviceId);
     console.log(`[DO] Device ${reason}: ${deviceId}`);
     await this.persistDevices();
@@ -909,7 +911,7 @@ export class WebSocketDurableObject {
     }
     if (hasActiveConnection || this.controllers.size > 0) {
       try {
-        await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
+        await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL);
       } catch (e) {
         console.error(`[DO] setAlarm err: ${e.message || e}`);
       }
@@ -1020,7 +1022,7 @@ export class WebSocketDurableObject {
       await this.persistDevices();
       this.broadcastDeviceList();
       if (this.devices.size === 1) {
-        await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
+        await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL);
       }
       return;
     }
@@ -1121,6 +1123,7 @@ export class WebSocketDurableObject {
 
   async webSocketClose(ws, code, reason, wasClean) {
     this.controllers.delete(ws);
+    this._wsRateMap?.delete(ws);
     let deviceRemoved = false;
     for (const [deviceId, dev] of this.devices) {
       if (dev.ws === ws) {
@@ -1141,6 +1144,7 @@ export class WebSocketDurableObject {
 
   async webSocketError(ws, error) {
     this.controllers.delete(ws);
+    this._wsRateMap?.delete(ws);
     let deviceRemoved = false;
     for (const [deviceId, dev] of this.devices) {
       if (dev.ws === ws) {
@@ -1159,9 +1163,9 @@ export class WebSocketDurableObject {
 }
 
 // ==================== Durable Object - 全局频率限制计数器 ====================
-export class RateLimiterDO {
-  constructor(state, env) {
-    this.state = state;
+export class RateLimiterDO extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
   }
 
   async fetch(request) {
@@ -1173,11 +1177,11 @@ export class RateLimiterDO {
 
     const now = Date.now();
     const key = `rl:${ip}`;
-    let entry = await this.state.storage.get(key);
+    let entry = await this.ctx.storage.get(key);
 
     if (!entry || now > entry.resetTime) {
       entry = { count: 1, resetTime: now + windowMs };
-      await this.state.storage.put(key, entry, { expirationTtl: Math.ceil(windowMs / 1000) + 10 });
+      await this.ctx.storage.put(key, entry, { expirationTtl: Math.ceil(windowMs / 1000) + 10 });
       return new Response(JSON.stringify({ allowed: true }));
     }
 
@@ -1187,7 +1191,7 @@ export class RateLimiterDO {
     }
 
     entry.count++;
-    await this.state.storage.put(key, entry, { expirationTtl: Math.ceil((entry.resetTime - now) / 1000) + 10 });
+    await this.ctx.storage.put(key, entry, { expirationTtl: Math.ceil((entry.resetTime - now) / 1000) + 10 });
     return new Response(JSON.stringify({ allowed: true }));
   }
 }
@@ -1201,14 +1205,17 @@ export default {
     if (url.pathname === '/api/auth' && request.method === 'POST') {
       try {
         const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-        const rlId = env.RATE_LIMITER.idFromName('global');
-        const rlStub = env.RATE_LIMITER.get(rlId);
-        const rlUrl = new URL(`http://rl/check?ip=${encodeURIComponent(ip)}&max=5&window=60000`);
-        const rlRes = await rlStub.fetch(rlUrl);
-        const rlData = await rlRes.json();
-        if (!rlData.allowed) {
-          return corsResponse(JSON.stringify({ error: '尝试次数过多，请稍后再试' }), 429);
-        }
+        // Rate limiter 失败时 fallback 为放行，防止 DO 异常导致用户无法登录
+        try {
+          const rlId = env.RATE_LIMITER.idFromName('global');
+          const rlStub = env.RATE_LIMITER.get(rlId);
+          const rlUrl = new URL(`http://rl/check?ip=${encodeURIComponent(ip)}&max=5&window=60000`);
+          const rlRes = await rlStub.fetch(rlUrl);
+          const rlData = await rlRes.json();
+          if (!rlData.allowed) {
+            return corsResponse(JSON.stringify({ error: '尝试次数过多，请稍后再试' }), 429);
+          }
+        } catch (_) { /* rate limiter unavailable, allow */ }
         const body = await request.json();
         const password = body.password || '';
         if (password === (env.PASSWORD || 'admin')) {
@@ -1227,6 +1234,9 @@ export default {
 
     // /ws — WebSocket 升级
     if (url.pathname === '/ws') {
+      if (request.headers.get('Upgrade') !== 'websocket') {
+        return new Response('Expected WebSocket', { status: 426 });
+      }
       const authed = await verifyWsAuth(request, env);
       if (!authed) {
         return new Response('Unauthorized', { status: 401 });

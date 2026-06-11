@@ -302,7 +302,7 @@ void typeString(const char* text) {
 
 // ==================== 指令处理 ====================
 void handleCommand(const char* json) {
-  StaticJsonDocument<512> doc;
+  JsonDocument doc;
   if (deserializeJson(doc, json)) return;
   const char* a = doc["a"];
   if (!a) return;
@@ -351,15 +351,15 @@ void handleCommand(const char* json) {
 // v19: 发送设备信息消息 (注册/心跳共用)
 void sendDeviceMessage(const char* msgType) {
   if (!wsConnected) return;
-  StaticJsonDocument<512> doc;
+  JsonDocument doc;
   doc["type"]       = msgType;
   doc["deviceId"]   = g_deviceId;
   doc["deviceName"] = g_deviceName;
-  JsonObject info = doc.createNestedObject("info");
+  JsonObject info = doc["info"].to<JsonObject>();
   info["bleConnected"] = bleConnected;
   info["bleEncrypted"] = bleEncrypted;
   info["bleBonded"]    = bleBonded;
-  JsonObject stats = info.createNestedObject("stats");
+  JsonObject stats = info["stats"].to<JsonObject>();
   stats["notifyOk"]   = g_notifyCount;
   stats["notifyFail"] = g_notifyFail;
   stats["disconn"]    = g_bleDisconnects;
@@ -403,18 +403,14 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
       g_lastWsMsgTime = millis();
 
       // v21: 对非 JSON 消息记录前缀，帮助诊断
-      #if VERBOSE_CMD
-        char preview[33];
-        size_t pl = length < 32 ? length : 32;
-        memcpy(preview, payload, pl);
-        preview[pl] = '\0';
-        // 清理换行符
-        for (size_t i = 0; i < pl; i++) if (preview[i] < 32 && preview[i] > 0) preview[i] = '.';
-      #endif
+      char preview[33];
+      size_t pl = length < 32 ? length : 32;
+      memcpy(preview, payload, pl);
+      preview[pl] = '\0';
+      for (size_t i = 0; i < pl; i++) if (preview[i] < 32 && preview[i] > 0) preview[i] = '.';
 
       // v20/v21/v32: 解析系统消息（register-ack, ping, hb-ack, ping-ack）
-      // v32: StaticJsonDocument<512> 确保容纳包含命令数组的 hb-ack/ping-ack
-      StaticJsonDocument<512> docAck;
+      JsonDocument docAck;
       if (!deserializeJson(docAck, (char*)payload)) {
         const char* msgType = docAck["type"];
 
@@ -436,16 +432,14 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
               }
             }
             // v38: 注册确认后立即发 ping 拉取 DO 中可能残留的待处理命令
-            // 根因：如果 regcmds 为空（或排空了 MAX_DRAIN_SIZE 条但还有剩余），
-            // ESP32 不会主动 ping → 剩余命令等到 15s heartbeat 才被拉取 → 高延迟
             g_lastCmdTime = millis();
             g_activePingCount = 0;
             g_lastActivePing = millis();
             Serial.println("[WS] Register ACK: sending ping to drain any pending commands");
             webSocket.sendTXT("{\"type\":\"ping\",\"deviceId\":\"" + g_deviceId + "\"}");
             g_lastWsMsgTime = millis();
-            break;
           }
+          break;
         }
 
         // v21: ping-pong 协议 — DO 可在休眠时发送 ping 测试连通性
