@@ -100,36 +100,7 @@ function corsResponse(body, status = 200) {
   });
 }
 
-// ==================== 登录频率限制 ====================
-const rateLimitMap = new Map();
-const RATE_LIMIT_MAX = 5;
-const RATE_LIMIT_WINDOW = 60000;
-
-function checkRateLimit(ip) {
-  const now = Date.now();
-  let entry = rateLimitMap.get(ip);
-  if (!entry || now > entry.resetTime) {
-    entry = { count: 1, resetTime: now + RATE_LIMIT_WINDOW };
-    rateLimitMap.set(ip, entry);
-    return true;
-  }
-  if (entry.count >= RATE_LIMIT_MAX) return false;
-  entry.count++;
-  return true;
-}
-
-function cleanupRateLimit() {
-  const now = Date.now();
-  // 分批清理，避免在单次调用中遍历过多条目
-  let deleted = 0;
-  for (const [ip, entry] of rateLimitMap) {
-    if (now > entry.resetTime) {
-      rateLimitMap.delete(ip);
-      deleted++;
-    }
-    if (deleted > 50) break; // 每次最多清理 50 条，防止阻塞
-  }
-}
+// ==================== 登录频率限制 (Durable Object 全局计数器) ====================
 
 // ==================== 登录页面 ====================
 const LOGIN_PAGE = `<!DOCTYPE html>
@@ -555,7 +526,7 @@ var TP=document.getElementById('tp'),TD=document.getElementById('td'),
     DI=document.getElementById('di');
 
 // State
-var ws=null,rt=null,ta=false,lx=0,ly=0,ts=0,tm=false,ml=false,sp=1;
+var ws=null,rt=null,ta=false,lx=0,ly=0,ts=0,tm=false,ml=false,sp=1,rc=0;
 var TAP=260,INT=35,lst=0;
 var selectedDeviceId=null,devices={};
 
@@ -601,13 +572,12 @@ function CN(){
     return;
   }
   US('connecting');
-  console.log('[WS] Connecting...');
   var p=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(p+'//'+location.host+'/ws');
-  _wsOpenTs=0;_sentCount=0;
+  _wsOpenTs=0;_sentCount=0;rc=0;
   ws.onopen=function(){
     _wsOpenTs=Date.now();
-    console.log('[WS] Opened @ '+new Date().toISOString());
+    console.log('[WS] Opened');
     refreshStatus();if(rt){clearTimeout(rt);rt=null}
     ws.send(JSON.stringify({type:'list-devices'}));
   };
@@ -623,13 +593,12 @@ function CN(){
   };
   ws.onmessage=function(e){
     try{var m=JSON.parse(e.data);
-      if(m.type==='device-list'){console.log('[WS] Received device list: '+(m.devices?m.devices.length:0)+' devices');updateDeviceList(m.devices);}
-      else if(m.type==='device-offline'){console.log('[WS] Device offline: '+m.deviceId);removeDevice(m.deviceId);}
-      else console.log('[WS] Received: '+m.type);
+      if(m.type==='device-list'){updateDeviceList(m.devices);}
+      else if(m.type==='device-offline'){console.warn('[WS] Device offline: '+m.deviceId);removeDevice(m.deviceId);}
     }catch(_){console.warn('[WS] Bad message: '+(typeof e.data==='string'?e.data.slice(0,60):'binary'))}
   };
 }
-function SR(){if(!rt)rt=setTimeout(CN,3000)}
+function SR(){if(!rt){var d=Math.min(3000*Math.pow(2,rc),30000);rc++;rt=setTimeout(CN,d)}}
 function US(s){
   SD.className='tpad-dot';
   if(s==='online'){
@@ -662,7 +631,6 @@ function SC(a,x){
   try{
     ws.send(JSON.stringify(cmd));
     _sentCount++;
-    console.log('[CMD] Sent #'+_sentCount+': '+JSON.stringify(cmd).slice(0,100));
   }catch(e){
     console.error('[CMD] Send failed: '+e.message);
     ws=null;SR();
@@ -922,7 +890,7 @@ export class WebSocketDurableObject {
     }
     for (const deviceId of stale) {
       this.devices.delete(deviceId);
-      console.log(`[DO] Device stale-cleaned: ${deviceId}`);
+      console.warn(`[DO] Device stale-cleaned: ${deviceId}`);
     }
     if (stale.length > 0) {
       await this.persistDevices();
@@ -954,28 +922,41 @@ export class WebSocketDurableObject {
     this.broadcastDeviceList();
   }
 
+  // v39: WS 消息频率限制 — per-device, 1 秒滑动窗口最多 20 条
+  checkWsRateLimit(ws) {
+    const now = Date.now();
+    if (!this._wsRateMap) this._wsRateMap = new Map();
+    const entry = this._wsRateMap.get(ws) || { count: 0, windowStart: now };
+    if (now - entry.windowStart > 1000) {
+      entry.count = 1;
+      entry.windowStart = now;
+    } else {
+      entry.count++;
+    }
+    this._wsRateMap.set(ws, entry);
+    if (entry.count > 20) return false;
+    return true;
+  }
+
   async webSocketMessage(ws, message) {
+    if (!this.checkWsRateLimit(ws)) return;
+
     let parsed;
     try {
       parsed = JSON.parse(message);
     } catch (_) {
-      console.log(`[DO] Bad JSON: ${typeof message === 'string' ? message.slice(0, 80) : 'binary'}`);
+      console.warn(`[DO] Bad JSON: ${typeof message === 'string' ? message.slice(0, 80) : 'binary'}`);
       return;
     }
 
     // v23: 关键修复 - DO Hibernation 后 Map 为空，必须先恢复持久化设备列表
-    // 否则命令路由找不到 targetId → 静默丢弃 → ESP32 日志 Cmd=0
     const wasMapEmpty = this.devices.size === 0;
     await this.loadDevicesFromStorage();
     if (wasMapEmpty && this.devices.size > 0) {
-      console.log(`[DO] Woke from hibernation: restored ${this.devices.size} device(s)`);
+      console.warn(`[DO] Woke from hibernation: restored ${this.devices.size} device(s)`);
     }
 
     const type = parsed.type || '?';
-    // v28: 入站消息摘要日志 — 记录每条消息的类型和目标
-    const targetPreview = parsed.to ? sanitizeDeviceId(parsed.to) : null;
-    const fromPreview = parsed.deviceId ? sanitizeDeviceId(parsed.deviceId) : null;
-    console.log(`[DO] Msg in: type=${type}, from=${(fromPreview || '??').slice(0, 20)}, to=${(targetPreview || '??').slice(0, 20)}, cmd=${(parsed.a || '').slice(0, 2)}`);
 
     // v38: 每次最多排空命令数 — 防止 JSON 超过 ESP32 接收缓冲区上限
     // arduinoWebSockets 默认缓冲区 512B，每条 ~60B，3 条 ≈200B 安全
@@ -988,7 +969,7 @@ export class WebSocketDurableObject {
     if (type === 'register') {
       const deviceId = espDeviceId;
       if (!deviceId) {
-        console.log(`[DO] Register rejected: invalid deviceId`);
+        console.warn(`[DO] Register rejected: invalid deviceId`);
         return;
       }
       const deviceName = sanitizeDeviceName(parsed.deviceName);
@@ -1052,7 +1033,6 @@ export class WebSocketDurableObject {
         dev.lastSeen = Date.now();
         this.controllers.delete(ws);
         if (parsed.info) dev.info = parsed.info;
-        console.log(`[DO] WS rebind: ${espDeviceId} (msg type=${type})`);
       }
       // v32: 命令嵌入消息回复，不再逐条 ws.send()
       // 根因: DO hibernation 恢复后 ws.send() 在 webSocketMessage 回调中不报错，
@@ -1123,7 +1103,7 @@ export class WebSocketDurableObject {
       if (!this.pendingCommands.has(targetId)) {
         this.pendingCommands.set(targetId, queue);
       }
-      console.log(`[DO] Cmd queued for ${targetId}: a=${cmd.a} (queue=${queue.length})`);
+      if (queue.length >= 15) console.warn(`[DO] Cmd queue high (${queue.length}) for ${targetId}`);
       // 必须持久化：DO hibernation 时内存 Map 会清空，不保存就永远丢失
       await this.persistPendingCommands();
       // 如果设备不在 Map 中 (已过期)，提示用户
@@ -1146,7 +1126,7 @@ export class WebSocketDurableObject {
       if (dev.ws === ws) {
         dev.ws = null;  // v21: 保留元信息但标记 ws 为 null，心跳超时后再彻底清理
         dev.lastSeen = Date.now();
-        console.log(`[DO] Device WS closed: ${deviceId} (keeping metadata, will expire on timeout)`);
+        console.warn(`[DO] Device WS closed: ${deviceId}`);
         deviceRemoved = true;
         break;
       }
@@ -1166,7 +1146,7 @@ export class WebSocketDurableObject {
       if (dev.ws === ws) {
         dev.ws = null;
         dev.lastSeen = Date.now();
-        console.log(`[DO] Device WS error: ${deviceId} (keeping metadata)`);
+        console.warn(`[DO] Device WS error: ${deviceId}`);
         deviceRemoved = true;
         break;
       }
@@ -1178,17 +1158,55 @@ export class WebSocketDurableObject {
   }
 }
 
+// ==================== Durable Object - 全局频率限制计数器 ====================
+export class RateLimiterDO {
+  constructor(state, env) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const ip = url.searchParams.get('ip');
+    const max = parseInt(url.searchParams.get('max') || '5', 10);
+    const windowMs = parseInt(url.searchParams.get('window') || '60000', 10);
+    if (!ip) return new Response('missing ip', { status: 400 });
+
+    const now = Date.now();
+    const key = `rl:${ip}`;
+    let entry = await this.state.storage.get(key);
+
+    if (!entry || now > entry.resetTime) {
+      entry = { count: 1, resetTime: now + windowMs };
+      await this.state.storage.put(key, entry, { expirationTtl: Math.ceil(windowMs / 1000) + 10 });
+      return new Response(JSON.stringify({ allowed: true }));
+    }
+
+    if (entry.count >= max) {
+      const retryAfter = Math.ceil((entry.resetTime - now) / 1000);
+      return new Response(JSON.stringify({ allowed: false, retryAfter }));
+    }
+
+    entry.count++;
+    await this.state.storage.put(key, entry, { expirationTtl: Math.ceil((entry.resetTime - now) / 1000) + 10 });
+    return new Response(JSON.stringify({ allowed: true }));
+  }
+}
+
 // ==================== Worker 入口 ====================
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    cleanupRateLimit();
 
     // POST /api/auth
     if (url.pathname === '/api/auth' && request.method === 'POST') {
       try {
         const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-        if (!checkRateLimit(ip)) {
+        const rlId = env.RATE_LIMITER.idFromName('global');
+        const rlStub = env.RATE_LIMITER.get(rlId);
+        const rlUrl = new URL(`http://rl/check?ip=${encodeURIComponent(ip)}&max=5&window=60000`);
+        const rlRes = await rlStub.fetch(rlUrl);
+        const rlData = await rlRes.json();
+        if (!rlData.allowed) {
           return corsResponse(JSON.stringify({ error: '尝试次数过多，请稍后再试' }), 429);
         }
         const body = await request.json();

@@ -45,12 +45,6 @@
 #define MAX_CMD_QUEUE 20
 
 // ==================== 用户配置 ====================
-//const char* WIFI_SSID = "你的WiFi名";
-//const char* WIFI_PASS = "你的WiFi密码";
-//const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";   // Cloudflare Worker 域名
-//const int   WS_PORT  = 443;
-//const char* WS_PATH  = "/ws?token=你的设备令牌";  // 须与 DEVICE_SECRET 一致
-
 const char* WIFI_SSID = "你的WiFi名";
 const char* WIFI_PASS = "你的WiFi密码";
 const char* WS_HOST  = "cf-esp32-blehid.你的用户名.workers.dev";   // Cloudflare Worker 域名
@@ -126,15 +120,19 @@ uint32_t g_wsMsgCount     = 0;  // v21: WebSocket 消息总数
 uint32_t g_lastCmdTime     = 0;  // v21: 上次收到命令的时间
 uint32_t g_lastWsMsgTime   = 0;  // v21: 上次收到任何 WS 消息的时间
 
-// v37: 活跃窗口高频拉取 — 收到命令后 10 秒内每秒 ping 一次，延迟 <1s
-// 根因：fix1 (v36 fast drain) 有 bug：onWsEvent 中 ping-ack 0 cmd 分支重复设置
-// g_lastFastDrainPing，导致 loop() 中 timer 永远被重置 → 无限 ping 循环。
-// fix2：缩短拉取间隔到 1s，10 秒窗口，确保用户操作间隙延迟 <1s。
-uint32_t g_lastActivePing   = 0;       // 上次活跃窗口 ping 的时间
-#define ACTIVE_WINDOW_MS         10000  // 收到命令后 10 秒内保持活跃
-#define ACTIVE_PING_INTERVAL     1000   // 活跃窗口内每 1 秒 ping 一次
-#define ACTIVE_PING_MAX          10     // 最多 10 次 (覆盖 10 秒窗口)
-uint8_t  g_activePingCount    = 0;      // 活跃窗口内已 ping 次数
+// 活跃窗口拉取 — 收到命令后 5 秒内每 2 秒 ping 一次
+uint32_t g_lastActivePing    = 0;
+#define ACTIVE_WINDOW_MS          5000
+#define ACTIVE_PING_INTERVAL      2000
+#define ACTIVE_PING_MAX           3
+uint8_t  g_activePingCount     = 0;
+
+// 重连指数退避
+uint8_t  g_reconnectAttempts  = 0;
+#define RECONNECT_BASE_MS         3000
+#define RECONNECT_MAX_MS          60000
+
+
 
 // v19: 多设备支持 - 设备标识
 String g_deviceId   = "";
@@ -380,13 +378,21 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_DISCONNECTED:
       wsConnected = false;
       g_registerAcked = false;
-      Serial.printf("[WS] Disconnected (total msgs received=%u)\n", g_wsMsgCount);
+      {
+        uint32_t backoff = RECONNECT_BASE_MS * (1 << g_reconnectAttempts);
+        if (backoff > RECONNECT_MAX_MS) backoff = RECONNECT_MAX_MS;
+        webSocket.setReconnectInterval(backoff);
+        if (g_reconnectAttempts < 10) g_reconnectAttempts++;
+        Serial.printf("[WS] Disconnected (msgs=%u), next reconnect in %lus\n", g_wsMsgCount, backoff / 1000);
+      }
       break;
     case WStype_CONNECTED:
       wsConnected = true;
       g_registerAcked = false;
       g_registerRetries = 0;
-      g_wsMsgCount = 0;          // 新连接重置消息计数
+      g_reconnectAttempts = 0;
+      webSocket.setReconnectInterval(3000);
+      g_wsMsgCount = 0;
       g_lastWsMsgTime = millis();
       Serial.println("[WS] Connected");
       sendDeviceMessage("register");
@@ -463,12 +469,9 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
               serializeJson(cmdObj, cmdStr);
               handleCommand((char*)cmdStr.c_str());
             }
-            // 收到命令 → 启动/重置活跃窗口 + 立即发 ping 排空下一批
             g_activePingCount = 0;
             g_lastActivePing = millis();
-            Serial.printf("[WS] Received %u cmd(s), sending ping for next batch\n", cmdCount);
-            webSocket.sendTXT("{\"type\":\"ping\",\"deviceId\":\"" + g_deviceId + "\"}");
-            g_lastWsMsgTime = millis();
+            Serial.printf("[WS] Received %u cmd(s)\n", cmdCount);
           } else {
             // ping-ack 返回 0 条 — 不做任何事，由 loop() 中的活跃窗口 timer 负责重试
             #if VERBOSE_CMD
