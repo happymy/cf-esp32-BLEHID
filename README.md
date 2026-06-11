@@ -7,7 +7,7 @@
 ```
 浏览器 (登录 → Web 控制页面 · 多设备切换 · 移动端优先 Dark UI)
     ↕ WebSocket (Cookie 认证)
-Cloudflare Worker v38 (Durable Object 多设备路由中继 · 命令入队持久化 · hb-ack/ping-ack 嵌入排空)
+Cloudflare Worker v39 (Durable Object 多设备路由中继 · 命令入队持久化 · hb-ack/ping-ack 嵌入排空)
     ↕ WebSocket (设备令牌认证 ?token=xxx)
 ESP32-C3 #1 ~ #N (WiFi + BLE HID v39 · 板载 LED 状态指示)
     ↕ BLE HID
@@ -31,8 +31,7 @@ worker/
 ├── package.json          # Node 依赖 (wrangler)
 ├── wrangler.toml         # Cloudflare Worker 配置 + 环境变量
 └── src/
-    ├── index.js          # Worker v38 (登录页 + 控制页 + DO 多设备路由)
-    └── hid.html          # 控制页面 HTML 模板
+    └── index.js          # Worker v39 (登录页 + 控制页 + DO 多设备路由 + 频率限制)
 
 esp32/
 ├── ble_hid_controller/
@@ -222,8 +221,9 @@ Web 页面与 ESP32 之间通过 JSON 通信，Worker Durable Object 中继转�
 
 | 版本 | 日期 | 主要变更 |
 |------|------|----------|
+| v39 (Worker) | 2026-06 | DurableObject 官方规范适配（extends + import）；Upgrade 请求头校验；登录限流器异常 fallback；_wsRateMap 残留清理 |
 | v39 (ESP32) | 2026-06 | 板载蓝色 LED 状态指示（快闪=WiFi断开，慢闪=服务器断开，双闪=BLE断开，常亮=全部正常） |
-| v38 (Worker) | 2026-06 | MAX_DRAIN_SIZE=3 心跳排空限流；修复定义顺序导致 ReferenceError |
+| v38 (Worker) | 2026-06 | MAX_DRAIN_SIZE=3 心跳排空限流；修复定义顺序导致 ReferenceError；preview 变量条件编译修复；ArduinoJson v6 API 确认 |
 | v37 (Worker) | 2026-06 | 活跃窗口高频拉取（10s 窗口 / 1s 间隔 / 最多 6 次 ping） |
 | v36 (Worker) | 2026-06 | alarm 触发 drainCommands 排空待发命令 |
 | v35 (Worker) | 2026-06 | DO hibernation 后通过 heartbeat/ping 重新绑定 ws |
@@ -307,5 +307,3 @@ A: 每台 ESP32 使用相同的 `DEVICE_SECRET` 令牌烧录固件，各自 MAC 
 ## 许可证
 
 MIT License
-```
-````

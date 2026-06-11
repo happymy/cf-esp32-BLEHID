@@ -18,7 +18,7 @@
  *
  * 库依赖（Arduino IDE 内安装）：
  *   NimBLE-Arduino v2.5.0 (h2zero)
- *   ArduinoJson v7.x (Benoit Blanchon)
+ *   ArduinoJson v6.x (Benoit Blanchon)
  *   arduinoWebSockets (Markus Sattler)
  *
  * 开发板：MakerGO ESP32-C3-SUPER-MINI, Partition Scheme = Huge APP
@@ -302,7 +302,7 @@ void typeString(const char* text) {
 
 // ==================== 指令处理 ====================
 void handleCommand(const char* json) {
-  JsonDocument doc;
+  StaticJsonDocument<512> doc;
   if (deserializeJson(doc, json)) return;
   const char* a = doc["a"];
   if (!a) return;
@@ -351,15 +351,15 @@ void handleCommand(const char* json) {
 // v19: 发送设备信息消息 (注册/心跳共用)
 void sendDeviceMessage(const char* msgType) {
   if (!wsConnected) return;
-  JsonDocument doc;
+  StaticJsonDocument<512> doc;
   doc["type"]       = msgType;
   doc["deviceId"]   = g_deviceId;
   doc["deviceName"] = g_deviceName;
-  JsonObject info = doc["info"].to<JsonObject>();
+  JsonObject info = doc.createNestedObject("info");
   info["bleConnected"] = bleConnected;
   info["bleEncrypted"] = bleEncrypted;
   info["bleBonded"]    = bleBonded;
-  JsonObject stats = info["stats"].to<JsonObject>();
+  JsonObject stats = info.createNestedObject("stats");
   stats["notifyOk"]   = g_notifyCount;
   stats["notifyFail"] = g_notifyFail;
   stats["disconn"]    = g_bleDisconnects;
@@ -410,7 +410,7 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
       for (size_t i = 0; i < pl; i++) if (preview[i] < 32 && preview[i] > 0) preview[i] = '.';
 
       // v20/v21/v32: 解析系统消息（register-ack, ping, hb-ack, ping-ack）
-      JsonDocument docAck;
+      StaticJsonDocument<512> docAck;
       if (!deserializeJson(docAck, (char*)payload)) {
         const char* msgType = docAck["type"];
 
