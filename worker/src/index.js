@@ -504,7 +504,7 @@ body{
   <!-- SPEED -->
   <div class="speed">
     <span class="ico">🐢</span>
-    <input type="range" id="ss" min="0.25" max="3" step="0.25" value="1">
+    <input type="range" id="ss" min="0.25" max="10" step="0.25" value="1">
     <span class="ico">🐇</span>
     <span class="speed-val" id="sv">1×</span>
   </div>
